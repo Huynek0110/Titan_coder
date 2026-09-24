@@ -137,3 +137,59 @@ test('unsupported URLs and methods return structured failures', async () => {
   const methodResult = await tools.execute('http_request', { url: 'https://example.test/', method: 'OPTIONS' });
   assert.equal(methodResult.ok, false);
 });
+
+test('native address-pinned transport is the default', () => {
+  assert.equal(new WebTools().nativeTransport, true);
+});
+
+test('redirects recheck DNS and strip sensitive headers across origins', async () => {
+  const calls = [];
+  let lookups = 0;
+  const tools = new WebTools({
+    lookup: async () => {
+      lookups += 1;
+      return [{ address: '93.184.216.34', family: 4 }];
+    },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return calls.length === 1
+        ? fakeResponse(302, '', { location: 'https://other.test/final' })
+        : fakeResponse(200, 'ok', { 'content-type': 'text/plain' });
+    },
+  });
+  const result = await tools.execute('http_request', {
+    url: 'https://example.test/start',
+    headers: {
+      Authorization: 'Bearer one',
+      Cookie: 'sid=two',
+      'X-Api-Key': 'three',
+      'X-Trace': 'keep',
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(lookups, 2);
+  assert.equal(calls.length, 2);
+  const redirectedHeaders = calls[1].options.headers;
+  assert.equal(redirectedHeaders.Authorization, undefined);
+  assert.equal(redirectedHeaders.Cookie, undefined);
+  assert.equal(redirectedHeaders['X-Api-Key'], undefined);
+  assert.equal(redirectedHeaders['X-Trace'], 'keep');
+});
+
+test('hop-by-hop request headers are rejected before a request', async () => {
+  let called = false;
+  const tools = new WebTools({
+    lookup: publicLookup(),
+    fetchImpl: async () => {
+      called = true;
+      return fakeResponse(200, 'ok');
+    },
+  });
+  const result = await tools.execute('http_request', {
+    url: 'https://example.test/',
+    headers: { Connection: 'close' },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(called, false);
+  assert.match(result.error, /not allowed|invalid/i);
+});

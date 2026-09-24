@@ -282,11 +282,16 @@ function summarize(session) {
   const messages = Array.isArray(session.messages) ? session.messages : [];
   const runs = Array.isArray(session.runs) ? session.runs : [];
   const toolRuns = Array.isArray(session.toolRuns) ? session.toolRuns : [];
+  const lastMessage = [...messages].reverse().find((message) => typeof message?.content === 'string' && message.content.trim());
+  const preview = lastMessage
+    ? String(lastMessage.content).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180)
+    : '';
   return decorateSession({
     id: session.id,
     workspace: session.workspace,
     mode: session.mode,
     title: session.title,
+    preview,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     messageCount: messages.length,

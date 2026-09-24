@@ -15,7 +15,7 @@
 - Tool `ask_user`: model phải hỏi khi thiếu thông tin thay vì bịa.
 - Lịch sử session, dừng lượt chạy, giới hạn bước và log đã redact secret.
 - Không hiển thị tool protocol/JSON thô trong câu trả lời.
-- Qwen Q3 thường phát `<call>` thay vì `tool_calls` chuẩn; mặc định app có lớp tương thích được bật, nhưng vẫn kiểm tra allowlist/schema và có thể tắt trong Settings → Agent.
+- Qwen Q3 thường phát `<call>` thay vì `tool_calls` chuẩn; app có lớp tương thích nhưng **mặc định để tắt** vì đây là quyền thay đổi trạng thái. Bật trong Settings → Agent sau khi bạn hiểu và xác nhận; lớp này vẫn kiểm tra allowlist/schema.
 
 ## Yêu cầu
 
@@ -24,13 +24,11 @@
 - LM Studio đã mở ít nhất một lần để tạo model catalog và CLI.
 - Model text đã được LM Studio nhận diện.
 
-Model hiện tại của máy:
+Preset được khuyến nghị cho **GTX 1050 Ti 4 GB** là **Qwen3 4B — GTX 1050 Ti 4GB**. App không tự tải model; người dùng tải GGUF `Q4_K_M` trong LM Studio rồi chọn preset trong **Settings → Mô hình**.
 
-```text
-qwen2.5-coder-14b-instruct (Qwen2, 14B, GGUF Q3_K_L)
-```
+Preset này điền cấu hình an toàn: context LM Studio `2048`, max output `2048`, ngân sách ngữ cảnh `8000` chars, Flash Attention bật, tối đa `1` subagent và không chạy song song. Có thể đổi sang preset Qwen2.5 Coder 3B nếu Qwen3 bị OOM.
 
-Q3_K_L nhẹ nhưng độ chính xác thấp hơn Q4_K_M/Q5. Ứng dụng giảm lỗi bằng tool routing, schema validation và giới hạn một tool call mỗi lượt; nếu phần cứng cho phép, Q4_K_M thường là điểm cân bằng tốt hơn.
+Model cũ `qwen2.5-coder-14b-instruct` vẫn dùng được nhưng không phù hợp để chạy toàn bộ trên VRAM 4 GB; phần lớn model sẽ bị offload sang RAM/CPU.
 
 ## Chạy lần đầu
 
@@ -55,7 +53,7 @@ Trong ứng dụng:
 1. Chọn **Workspace** (thư mục dự án). Mọi file tool mặc định chỉ nằm trong workspace này.
 2. Bấm **Kiểm tra kết nối**.
 3. Nếu báo chưa chạy, bấm **Bật LM Studio Server**. App chạy `lms server start --port 1234`.
-4. Chọn model `qwen2.5-coder-14b-instruct` và bấm **Load model**. Context mặc định nên là `8192` khi VRAM/RAM hạn chế.
+4. Trong **Settings → Mô hình**, chọn preset **Qwen3 4B — GTX 1050 Ti 4GB**, kiểm tra ID model rồi bấm **Load model**. App gửi cấu hình context `2048` và Flash Attention; nếu LM Studio báo không hỗ trợ Flash Attention, tắt tùy chọn này.
 5. Bắt đầu chat.
 
 LM Studio CLI thường nằm tại:

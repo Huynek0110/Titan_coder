@@ -10,6 +10,9 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const STATUS_TIMEOUT_MS = 2_500;
 const MAX_SSE_BUFFER_CHARS = 2 * 1024 * 1024;
 const MAX_SSE_EVENT_CHARS = 1024 * 1024;
+const MAX_GENERATION_CHARS = 500_000;
+const MAX_TOOL_ARGUMENT_CHARS = 64_000;
+const MAX_TOOL_NAME_CHARS = 256;
 
 function cleanBaseUrl(value) {
   let raw = String(value || 'http://127.0.0.1:1234/v1').trim().replace(/[\\/]+$/, '');
@@ -75,8 +78,8 @@ function mergeToolCallFragments(map, fragments) {
     const target = map.get(index);
     if (fragment.id) target.id += fragment.id;
     if (fragment.type) target.type = fragment.type;
-    if (fragment.function?.name) target.function.name += fragment.function.name;
-    if (fragment.function?.arguments) target.function.arguments += fragment.function.arguments;
+    if (fragment.function?.name) target.function.name = `${target.function.name}${fragment.function.name}`.slice(0, MAX_TOOL_NAME_CHARS);
+    if (fragment.function?.arguments) target.function.arguments = `${target.function.arguments}${fragment.function.arguments}`.slice(0, MAX_TOOL_ARGUMENT_CHARS);
   }
 }
 
@@ -199,14 +202,22 @@ class LMStudioClient {
     const scored = models.filter((model) => model.type === 'llm').map((model) => {
       const value = `${model.id} ${model.displayName} ${model.quantization}`.toLowerCase();
       let score = 0;
-      if (value.includes('qwen2.5-coder')) score += 100;
-      if (value.includes('14b')) score += 30;
-      if (value.includes('instruct')) score += 10;
+      // Prefer the small Qwen3 coding profile used by the GTX 1050 Ti
+      // configuration. Keep larger Qwen models as fallbacks, but do not
+      // select a 14B model merely because it is already installed.
+      if (value.includes('qwen3')) score += 120;
+      if (value.includes('qwen3-coder')) score += 10;
+      if (value.includes('4b')) score += 45;
+      if (value.includes('instruct-2507')) score += 12;
+      if (value.includes('qwen2.5-coder')) score += 35;
+      if (value.includes('14b')) score -= 100;
+      if (value.includes('7b') || value.includes('8b')) score -= 20;
+      if (value.includes('q4_k_m')) score += 8;
+      if (value.includes('instruct')) score += 5;
       if (model.loadedInstances.length) score += 100;
-      if (value.includes('q3_k_l')) score += 4;
       return { model, score };
     }).sort((a, b) => b.score - a.score);
-    return scored[0]?.score > 0 ? scored[0].model : null;
+    return scored[0]?.model || null;
   }
 
   async loadModel(modelId, options = {}) {
@@ -338,10 +349,14 @@ class LMStudioClient {
     if (!response.body || contentType.includes('application/json')) {
       const payload = await response.json();
       const message = payload?.choices?.[0]?.message || {};
-      const text = String(message.content || '');
+      const text = String(message.content || '').slice(0, MAX_GENERATION_CHARS);
       if (text && onDelta) onDelta(text);
       const toolMap = new Map();
       mergeToolCallFragments(toolMap, (message.tool_calls || []).map((call, index) => ({ ...call, index })));
+      for (const call of toolMap.values()) {
+        call.function.name = String(call.function.name || '').slice(0, MAX_TOOL_NAME_CHARS);
+        call.function.arguments = String(call.function.arguments || '').slice(0, MAX_TOOL_ARGUMENT_CHARS);
+      }
       return {
         content: text,
         toolCalls: [...toolMap.values()],
@@ -383,10 +398,24 @@ class LMStudioClient {
       if (choice.finish_reason) finishReason = choice.finish_reason;
       const delta = choice.delta || choice.message || {};
       if (typeof delta.content === 'string' && delta.content) {
+        if (content.length + delta.content.length > MAX_GENERATION_CHARS) {
+          streamError = new Error('LM Studio vượt quá giới hạn nội dung sinh.');
+          return;
+        }
         content += delta.content;
         if (onDelta) onDelta(delta.content);
       }
       mergeToolCallFragments(toolMap, delta.tool_calls);
+      for (const call of toolMap.values()) {
+        if (call.function.name.length > MAX_TOOL_NAME_CHARS) {
+          streamError = new Error('Tool name từ LM Studio quá dài.');
+          return;
+        }
+        if (call.function.arguments.length > MAX_TOOL_ARGUMENT_CHARS) {
+          streamError = new Error('Tool arguments từ LM Studio quá dài.');
+          return;
+        }
+      }
     };
 
     try {

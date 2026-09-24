@@ -25,6 +25,7 @@ const SAFE_LIMITS = Object.freeze({
   temperature: Object.freeze({ min: 0, max: 2 }),
   topP: Object.freeze({ min: 0, max: 1 }),
   maxTokens: Object.freeze({ min: 1, max: 1_000_000 }),
+  contextLength: Object.freeze({ min: 512, max: 32_768 }),
   contextChars: Object.freeze({ min: 1_000, max: 2_000_000 }),
   maxSteps: Object.freeze({ min: 1, max: 100 }),
   maxSubagents: Object.freeze({ min: 0, max: 20 }),
@@ -50,16 +51,19 @@ const SAFE_LIMITS = Object.freeze({
 const DEFAULT_SETTINGS = {
   lmBaseUrl: 'http://127.0.0.1:1234/v1',
   model: '',
+  modelPreset: 'qwen3-4b-1050ti',
   temperature: 0.2,
   topP: 0.9,
-  maxTokens: 4096,
-  contextChars: 24_000,
-  maxSteps: 12,
-  maxSubagents: 3,
-  maxConcurrentSubagents: 2,
-  maxSubagentSteps: 8,
+  maxTokens: 2048,
+  contextLength: 2048,
+  contextChars: 8000,
+  maxSteps: 8,
+  maxSubagents: 1,
+  maxConcurrentSubagents: 1,
+  maxSubagentSteps: 6,
+  flashAttention: true,
   approvalMode: 'automatic',
-  allowFallbackTools: true,
+  allowFallbackTools: false,
   fileRoot: '',
   webProvider: 'duckduckgo',
   braveApiKey: '',
@@ -89,18 +93,22 @@ Object.freeze(DEFAULT_SETTINGS);
 const DEFAULT_CONFIG = Object.freeze({ app: APP_INFO, settings: DEFAULT_SETTINGS });
 
 const APPROVAL_MODES = new Set(['automatic', 'manual', 'ask', 'always', 'never']);
+const MODEL_PRESETS = new Set(['qwen3-4b-1050ti', 'qwen25-coder-3b', 'qwen25-coder-14b', 'custom']);
 const WEB_PROVIDERS = new Set(['duckduckgo', 'brave']);
 const KNOWN_KEYS = new Set([
   'lmBaseUrl',
   'model',
+  'modelPreset',
   'temperature',
   'topP',
   'maxTokens',
+  'contextLength',
   'contextChars',
   'maxSteps',
   'maxSubagents',
   'maxConcurrentSubagents',
   'maxSubagentSteps',
+  'flashAttention',
   'approvalMode',
   'allowFallbackTools',
   'fileRoot',
@@ -279,6 +287,9 @@ function sanitizeSettings(value) {
       case 'model':
         result[key] = normalizeString(candidate, result[key], SAFE_LIMITS.modelChars);
         break;
+      case 'modelPreset':
+        result[key] = normalizeEnum(candidate, MODEL_PRESETS, result[key]);
+        break;
       case 'temperature':
         result[key] = normalizeNumber(candidate, result[key], SAFE_LIMITS.temperature);
         break;
@@ -287,6 +298,9 @@ function sanitizeSettings(value) {
         break;
       case 'maxTokens':
         result[key] = normalizeInteger(candidate, result[key], SAFE_LIMITS.maxTokens);
+        break;
+      case 'contextLength':
+        result[key] = normalizeInteger(candidate, result[key], SAFE_LIMITS.contextLength);
         break;
       case 'contextChars':
         result[key] = normalizeInteger(candidate, result[key], SAFE_LIMITS.contextChars);
@@ -302,6 +316,9 @@ function sanitizeSettings(value) {
         break;
       case 'maxSubagentSteps':
         result[key] = normalizeInteger(candidate, result[key], SAFE_LIMITS.maxSubagentSteps);
+        break;
+      case 'flashAttention':
+        result[key] = typeof candidate === 'boolean' ? candidate : result[key];
         break;
       case 'approvalMode':
         result[key] = normalizeEnum(candidate, APPROVAL_MODES, result[key]);
@@ -398,6 +415,12 @@ function validateSettingsPatch(patch, current = DEFAULT_SETTINGS) {
       case 'model':
         result[key] = assertString(candidate, key, SAFE_LIMITS.modelChars);
         break;
+      case 'modelPreset': {
+        const preset = assertString(candidate, key, 64, { allowEmpty: false }).toLowerCase();
+        if (!MODEL_PRESETS.has(preset)) throw invalid('modelPreset is not supported');
+        result[key] = preset;
+        break;
+      }
       case 'temperature':
         result[key] = assertNumber(candidate, key, SAFE_LIMITS.temperature);
         break;
@@ -405,12 +428,17 @@ function validateSettingsPatch(patch, current = DEFAULT_SETTINGS) {
         result[key] = assertNumber(candidate, key, SAFE_LIMITS.topP);
         break;
       case 'maxTokens':
+      case 'contextLength':
       case 'contextChars':
       case 'maxSteps':
       case 'maxSubagents':
       case 'maxConcurrentSubagents':
       case 'maxSubagentSteps':
         result[key] = assertNumber(candidate, key, SAFE_LIMITS[key], true);
+        break;
+      case 'flashAttention':
+        if (typeof candidate !== 'boolean') throw invalid('flashAttention must be a boolean');
+        result[key] = candidate;
         break;
       case 'approvalMode': {
         const mode = assertString(candidate, key, 64, { allowEmpty: false }).toLowerCase();
@@ -489,6 +517,7 @@ module.exports = {
   MAX_MESSAGES_PER_SESSION: SAFE_LIMITS.maxMessagesPerSession,
   MAX_TOOL_DATA_BYTES: SAFE_LIMITS.maxToolDataBytes,
   APPROVAL_MODES: Object.freeze([...APPROVAL_MODES]),
+  MODEL_PRESETS: Object.freeze([...MODEL_PRESETS]),
   WEB_PROVIDERS: Object.freeze([...WEB_PROVIDERS]),
   KNOWN_KEYS: Object.freeze([...KNOWN_KEYS]),
   isPlainObject,

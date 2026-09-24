@@ -65,24 +65,32 @@ async function cdpClient() {
       else resolve(message.result);
     }
   });
-  const call = (method, params = {}) => new Promise((resolve, reject) => {
+  const call = (method, params = {}, timeoutMs = 3000) => new Promise((resolve, reject) => {
     const id = ++nextId;
     pending.set(id, { resolve, reject });
     socket.send(JSON.stringify({ id, method, params }));
     setTimeout(() => {
       if (pending.delete(id)) reject(new Error(`CDP timeout: ${method}`));
-    }, 3000);
+    }, timeoutMs);
   });
   return { socket, call };
 }
 
-function killTree() {
+async function stopChild() {
   if (!child.pid || child.exitCode !== null) return;
   if (process.platform === 'win32') {
     spawnSync('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, timeout: 5000 });
   } else {
     child.kill('SIGKILL');
   }
+  await Promise.race([
+    new Promise((resolve) => {
+      if (child.exitCode !== null) return resolve();
+      child.once('close', resolve);
+      child.once('error', resolve);
+    }),
+    delay(3000),
+  ]);
 }
 
 async function withDeadline(promise, milliseconds, label) {
@@ -105,26 +113,50 @@ async function withDeadline(promise, milliseconds, label) {
     const cdp = await withDeadline(cdpClient(), 20_000, 'Electron smoke');
     await cdp.call('Runtime.enable');
     await cdp.call('Page.enable');
-    const evaluation = await cdp.call('Runtime.evaluate', {
-      expression: `JSON.stringify({title: document.title, hasApi: Boolean(window.codepilot), body: document.body?.innerText?.slice(0, 300), ready: document.readyState})`,
-      returnByValue: true,
-    });
-    const details = JSON.parse(evaluation.result.value);
-    if (!String(details.title || '').startsWith('CodePilot') || !details.hasApi || details.ready !== 'complete') {
+    let details = null;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      try {
+        const evaluation = await cdp.call('Runtime.evaluate', {
+          expression: `JSON.stringify({title: document.title, hasApi: Boolean(window.codepilot), body: document.body?.innerText?.slice(0, 300), ready: document.readyState})`,
+          returnByValue: true,
+        });
+        if (evaluation?.result?.value) details = JSON.parse(evaluation.result.value);
+        if (details?.ready === 'complete' && details.hasApi) break;
+      } catch { /* renderer can still be loading or navigating */ }
+      await delay(250);
+    }
+    if (!details || !String(details.title || '').startsWith('CodePilot') || !details.hasApi || details.ready !== 'complete') {
       throw new Error(`Unexpected renderer: ${JSON.stringify(details)}\n${logs}`);
     }
-    const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
-    const screenshotPath = path.join(outputDir, 'electron-smoke.png');
-    fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+    try {
+      const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, 15_000);
+      if (screenshot?.data) {
+        const screenshotPath = path.join(outputDir, 'electron-smoke.png');
+        fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+        console.log(`Screenshot: ${screenshotPath}`);
+      }
+    } catch (error) {
+      console.warn(`Screenshot optional and unavailable: ${error.message}`);
+    }
     console.log(`Electron smoke OK: ${JSON.stringify(details)}`);
-    console.log(`Screenshot: ${screenshotPath}`);
     code = 0;
     cdp.socket.close();
   } catch (error) {
     console.error(error?.stack || error);
   } finally {
-    killTree();
-    fs.rmSync(userData, { recursive: true, force: true });
+    await stopChild();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        break;
+      } catch (error) {
+        if (attempt === 4) {
+          console.warn(`Could not remove smoke profile: ${error.message}`);
+        } else {
+          await delay(250);
+        }
+      }
+    }
   }
   process.exit(code);
 })();

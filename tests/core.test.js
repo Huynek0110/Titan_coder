@@ -281,6 +281,23 @@ test('fallback mutation requires explicit approval in ask mode', async () => {
   assert.equal(calls, 1);
 });
 
+test('legacy always/manual approval modes still require confirmation', async () => {
+  for (const mode of ['always', 'manual']) {
+    let calls = 0;
+    let approvals = 0;
+    const broker = new ToolBroker({
+      sources: [testToolSource(['write_file'], () => { calls += 1; })],
+      interactionProvider: async () => { approvals += 1; return false; },
+    });
+    const result = await broker.execute('write_file', { path: 'x' }, {
+      mode: 'agent', allowedNames: ['write_file'], allowMutation: true, allowMcp: false, approvalMode: mode,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(calls, 0);
+    assert.equal(approvals, 1);
+  }
+});
+
 test('AbortError from a tool source is rethrown', async () => {
   const abort = new Error('cancelled');
   abort.name = 'AbortError';

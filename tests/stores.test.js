@@ -30,6 +30,11 @@ test('defaults and settings sanitization are stable', () => {
   assert.equal(DEFAULT_SETTINGS.temperature, 0.2);
   assert.equal(DEFAULT_SETTINGS.webProvider, 'duckduckgo');
   assert.equal(DEFAULT_SETTINGS.searchProvider, 'duckduckgo');
+  assert.equal(DEFAULT_SETTINGS.modelPreset, 'qwen3-4b-1050ti');
+  assert.equal(DEFAULT_SETTINGS.contextLength, 2048);
+  assert.equal(DEFAULT_SETTINGS.maxTokens, 2048);
+  assert.equal(DEFAULT_SETTINGS.maxSubagents, 1);
+  assert.equal(DEFAULT_SETTINGS.flashAttention, true);
 
   const clean = sanitizeSettings({
     temperature: 99,
@@ -49,6 +54,15 @@ test('defaults and settings sanitization are stable', () => {
   const updated = updateSettings(DEFAULT_SETTINGS, { model: 'local', fileRoot: '' });
   assert.equal(updated.model, 'local');
   assert.equal(DEFAULT_SETTINGS.model, '');
+
+  const tuned = updateSettings(DEFAULT_SETTINGS, {
+    modelPreset: 'qwen3-4b-1050ti', contextLength: 4096, maxTokens: 1024, flashAttention: false,
+  });
+  assert.equal(tuned.modelPreset, 'qwen3-4b-1050ti');
+  assert.equal(tuned.contextLength, 4096);
+  assert.equal(tuned.maxTokens, 1024);
+  assert.equal(tuned.flashAttention, false);
+  assert.throws(() => updateSettings(DEFAULT_SETTINGS, { modelPreset: 'unknown' }), /modelPreset/);
 });
 
 test('settings encrypt and redact a brave API key with safeStorage', async (t) => {
@@ -88,6 +102,18 @@ test('settings encrypt and redact a brave API key with safeStorage', async (t) =
 
   await reloaded.clear();
   assert.equal(reloaded.get().braveApiKeyPresent, false);
+});
+
+test('settings preserve redacted MCP secrets when the form is saved', async (t) => {
+  const store = new SettingsStore({ dir: tempDir(t) });
+  await store.init();
+  const mcp = { remote: { url: 'https://mcp.example.test/mcp', headers: { Authorization: 'Bearer super-secret' } } };
+  await store.update({ mcpServers: mcp });
+  const publicSettings = store.get();
+  assert.equal(publicSettings.mcpServers.remote.headers.Authorization, '[REDACTED]');
+  await store.update({ mcpServers: publicSettings.mcpServers, model: 'still-local' });
+  assert.equal(store.getInternal().mcpServers.remote.headers.Authorization, 'Bearer super-secret');
+  assert.equal(store.getInternal().model, 'still-local');
 });
 
 test('settings persist updates atomically and recover from corruption', async (t) => {

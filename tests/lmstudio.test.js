@@ -48,6 +48,18 @@ test('status reads the native model list only once', async () => {
   assert.equal(calls, 1);
 });
 
+test('prefers the Qwen3 4B profile over a large installed model', async () => {
+  const client = new LMStudioClient({
+    getSettings: async () => ({ lmBaseUrl: 'http://127.0.0.1:1234/v1', model: '' }),
+    fetchImpl: async () => new Response(JSON.stringify({ models: [
+      { type: 'llm', key: 'qwen2.5-coder-14b-instruct', display_name: 'Qwen2.5 14B', loaded_instances: [] },
+      { type: 'llm', key: 'qwen3-4b-instruct-2507', display_name: 'Qwen3 4B', loaded_instances: [] },
+    ] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  });
+  const status = await client.getStatus();
+  assert.equal(status.selectedModel, 'qwen3-4b-instruct-2507');
+});
+
 test('chat stream stops on DONE and returns tool fragments', async () => {
   const client = new LMStudioClient({
     getSettings: async () => ({

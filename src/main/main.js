@@ -16,7 +16,7 @@ const { LMStudioClient } = require('./core/lmstudio');
 const { ToolBroker } = require('./core/tool-broker');
 const { AgentRunner } = require('./core/agent-runner');
 const { InteractionManager } = require('./core/interaction-manager');
-const { Logger } = require('./core/logger');
+const { Logger, redact } = require('./core/logger');
 const { SettingsStore } = require('./core/settings-store');
 const { SessionStore } = require('./core/session-store');
 const { WorkspaceTools } = require('./tools/workspace-tools');
@@ -28,18 +28,37 @@ const MAX_MESSAGE_CHARS = 40_000;
 const MAX_ATTACHMENTS = 6;
 const MAX_ATTACHMENT_BYTES = 750_000;
 
+function safeClientId(value, prefix) {
+  const text = String(value || '');
+  return new RegExp(`^${prefix}-[A-Za-z0-9_-]{1,120}$`).test(text) ? text : `${prefix}-${crypto.randomUUID()}`;
+}
+
 let mainWindow = null;
 let services = null;
 let statusTimer = null;
 let lastStatusSignature = '';
 let statusPollInFlight = false;
+let quitting = false;
+let quitReady = false;
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
 
 function cloneEventPayload(payload) {
-  try { return structuredClone(payload); } catch { /* fall through to JSON-safe clone */ }
   try {
-    return JSON.parse(JSON.stringify(payload, (_key, value) => {
+    const safe = redact(payload);
+    return JSON.parse(JSON.stringify(safe, (_key, value) => {
       if (typeof value === 'function' || typeof value === 'symbol') return undefined;
-      if (value instanceof Error) return { name: value.name, message: value.message };
+      if (typeof value === 'string' && value.length > 100_000) return `${value.slice(0, 100_000)}…[event payload truncated]`;
       return value;
     }));
   } catch {
@@ -91,6 +110,7 @@ function createServices() {
     globalRunId: null,
     toolRoot: null,
     revealPaths: new Set(),
+    approvedRoots: new Set(),
     systemTools: null,
     workspaceTools: null,
   };
@@ -119,7 +139,7 @@ async function rebuildToolSources(root, { force = false, allowActive = false } =
   services.systemTools = systemTools;
   services.webTools = webTools;
   services.toolRoot = safeRoot;
-  rememberRevealPath(safeRoot);
+  await rememberApprovedRoot(safeRoot);
   services.broker.setSources([workspaceTools, systemTools, webTools, services.mcpManager]);
 }
 
@@ -139,7 +159,9 @@ async function reloadConfiguredMcp() {
 async function initializeServices() {
   await services.settingsStore.init();
   await services.sessionStore.init();
-  await rebuildToolSources((await services.settingsStore.getInternal()).fileRoot || app.getPath('userData'));
+  const initialSettings = await services.settingsStore.getInternal();
+  if (initialSettings.fileRoot) await rememberApprovedRoot(initialSettings.fileRoot);
+  await rebuildToolSources(initialSettings.fileRoot || app.getPath('userData'));
   services.logger.info('Application services initialized');
 }
 
@@ -172,6 +194,23 @@ function pathInside(root, target) {
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+async function canonicalExistingPath(value) {
+  try { return await fs.realpath(path.resolve(String(value || ''))); } catch { return null; }
+}
+
+async function rememberApprovedRoot(value) {
+  const canonical = await canonicalExistingPath(value);
+  if (canonical) {
+    services.approvedRoots.add(canonical.toLowerCase());
+    rememberRevealPath(canonical);
+  }
+  return canonical;
+}
+
+function isApprovedRoot(value) {
+  return services.approvedRoots.has(path.resolve(String(value || '')).toLowerCase());
+}
+
 function rememberRevealPath(target) {
   if (target) services.revealPaths.add(path.resolve(target).toLowerCase());
 }
@@ -180,6 +219,21 @@ function isAllowedRevealPath(target) {
   const value = path.resolve(target);
   if (services.toolRoot && pathInside(services.toolRoot, value)) return true;
   return services.revealPaths.has(value.toLowerCase());
+}
+
+function equivalentIgnoringRedacted(current, incoming) {
+  if (incoming === '[REDACTED]') return true;
+  if (Array.isArray(current) || Array.isArray(incoming)) {
+    if (!Array.isArray(current) || !Array.isArray(incoming) || current.length !== incoming.length) return false;
+    return current.every((value, index) => equivalentIgnoringRedacted(value, incoming[index]));
+  }
+  if (current && typeof current === 'object' && incoming && typeof incoming === 'object') {
+    const currentKeys = Object.keys(current);
+    const incomingKeys = Object.keys(incoming);
+    if (currentKeys.length !== incomingKeys.length) return false;
+    return incomingKeys.every((key) => Object.prototype.hasOwnProperty.call(current, key) && equivalentIgnoringRedacted(current[key], incoming[key]));
+  }
+  return current === incoming;
 }
 
 function releaseRun(runId, sessionId) {
@@ -208,7 +262,12 @@ function registerIpc() {
     return session;
   });
   handle('sessions:create', async (_event, payload = {}) => {
-    const workspace = payload.workspace ? path.resolve(String(payload.workspace)) : '';
+    const requestedWorkspace = payload.workspace ? path.resolve(String(payload.workspace)) : '';
+    if (requestedWorkspace && !isApprovedRoot(requestedWorkspace)) {
+      throw new Error('Workspace chưa được chọn qua hộp thoại chính của CodePilot.');
+    }
+    const configuredWorkspace = (await services.settingsStore.getInternal()).fileRoot || '';
+    const workspace = requestedWorkspace || (isApprovedRoot(configuredWorkspace) ? configuredWorkspace : '');
     const mode = ['chat', 'agent', 'plan'].includes(payload.mode) ? payload.mode : 'agent';
     const session = await services.sessionStore.createSession({ workspace, mode });
     sendEvent({ type: 'session-created', session });
@@ -249,7 +308,7 @@ function registerIpc() {
       const workspace = session.workspace || (await services.settingsStore.getInternal()).fileRoot || '';
       if (workspace) await rebuildToolSources(workspace, { allowActive: true });
       const userMessage = {
-        id: `msg_${crypto.randomUUID()}`,
+        id: safeClientId(payload.clientMessageId, 'user'),
         role: 'user',
         content: text,
         createdAt: Date.now(),
@@ -282,7 +341,7 @@ function registerIpc() {
         });
         if (controller.signal.aborted) throw abortError();
         const assistantMessage = {
-          id: `msg_${crypto.randomUUID()}`,
+          id: safeClientId(payload.clientAssistantMessageId, 'assistant'),
           role: 'assistant',
           content: result.text,
           createdAt: Date.now(),
@@ -337,6 +396,7 @@ function registerIpc() {
     });
     if (result.canceled || !result.filePaths[0]) return null;
     const workspace = path.resolve(result.filePaths[0]);
+    await rememberApprovedRoot(workspace);
     await services.settingsStore.update({ fileRoot: workspace });
     await rebuildToolSources(workspace);
     sendEvent({ type: 'workspace-changed', workspace });
@@ -353,15 +413,17 @@ function registerIpc() {
 
   handle('shell:open-external', async (_event, { url } = {}) => {
     const parsed = new URL(String(url || ''));
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Chỉ được mở liên kết http/https.');
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('Chỉ được mở liên kết http/https không chứa credential.');
     await shell.openExternal(parsed.toString());
     return { ok: true };
   });
   handle('shell:reveal-path', async (_event, { path: targetPath } = {}) => {
-    const value = path.resolve(String(targetPath || ''));
-    if (!isAllowedRevealPath(value)) throw new Error('Đường dẫn không thuộc workspace hoặc tệp người dùng đã chọn.');
-    const stat = await fs.stat(value).catch(() => null);
-    if (!stat) throw new Error('Đường dẫn không tồn tại.');
+    const requested = path.resolve(String(targetPath || ''));
+    const value = await canonicalExistingPath(requested);
+    if (!value) throw new Error('Đường dẫn không tồn tại.');
+    const root = services.toolRoot ? await canonicalExistingPath(services.toolRoot) : null;
+    const allowed = (root && pathInside(root, value)) || services.revealPaths.has(value.toLowerCase());
+    if (!allowed) throw new Error('Đường dẫn không thuộc workspace hoặc tệp người dùng đã chọn.');
     shell.showItemInFolder(value);
     return { ok: true };
   });
@@ -369,15 +431,62 @@ function registerIpc() {
   handle('settings:get', () => services.settingsStore.get());
   handle('settings:update', async (_event, patch = {}) => {
     if (services.globalRunId) throw new Error('Hãy dừng lượt agent trước khi đổi cấu hình.');
-    const settings = await services.settingsStore.update(patch);
-    const internal = await services.settingsStore.getInternal();
-    const toolKeys = ['fileRoot', 'searchProvider', 'braveApiKey', 'mcpServers'];
-    const toolsChanged = toolKeys.some((key) => Object.prototype.hasOwnProperty.call(patch, key));
-    await rebuildToolSources(internal.fileRoot || app.getPath('userData'), { force: toolsChanged });
-    const mcpStatus = toolsChanged ? await reloadConfiguredMcp() : await services.mcpManager.status();
-    sendEvent({ type: 'settings-updated', settings });
-    sendEvent({ type: 'mcp-status', status: mcpStatus });
-    return settings;
+    const requestedRoot = Object.prototype.hasOwnProperty.call(patch, 'fileRoot') ? patch.fileRoot : patch.workspace;
+    if (requestedRoot && !isApprovedRoot(path.resolve(String(requestedRoot)))) {
+      throw new Error('Workspace chỉ được thay đổi qua hộp thoại chọn thư mục.');
+    }
+    if (patch.allowFallbackTools === true && (await services.settingsStore.getInternal()).allowFallbackTools !== true) {
+      const fallbackConfirmation = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        title: 'Bật tương thích tool Qwen',
+        message: 'Qwen Q3 có thể phát tool call dạng <call> thay vì tool_calls chuẩn.',
+        detail: 'Bật tùy chọn này cho phép fallback dạng read-only/mutation trong Agent. Mọi tool vẫn bị giới hạn bởi workspace, allowlist và schema, nhưng đây là quyền thay đổi trạng thái.',
+        buttons: ['Hủy', 'Bật'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      if (fallbackConfirmation.response !== 1) throw new Error('Đã hủy bật fallback Qwen.');
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'mcpServers')) {
+      const currentMcp = (await services.settingsStore.getInternal()).mcpServers || {};
+      const requestedMcp = patch.mcpServers || {};
+      if (!equivalentIgnoringRedacted(currentMcp, requestedMcp)) {
+        const confirmation = await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          title: 'Xác nhận cấu hình MCP',
+          message: 'Cấu hình MCP có thể chạy chương trình hoặc gửi request đến server bên ngoài.',
+          detail: 'Chỉ tiếp tục nếu bạn tin tưởng tất cả command, URL và secret trong cấu hình.',
+          buttons: ['Hủy', 'Áp dụng'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        });
+        if (confirmation.response !== 1) throw new Error('Đã hủy cập nhật MCP.');
+      }
+    }
+    const previous = await services.settingsStore.getInternal();
+    let settings;
+    try {
+      settings = await services.settingsStore.update(patch);
+      const internal = await services.settingsStore.getInternal();
+      const toolKeys = ['fileRoot', 'webProvider', 'searchProvider', 'braveApiKey', 'mcpServers'];
+      const toolsChanged = toolKeys.some((key) => Object.prototype.hasOwnProperty.call(patch, key));
+      await rebuildToolSources(internal.fileRoot || app.getPath('userData'), { force: toolsChanged });
+      const mcpStatus = Object.prototype.hasOwnProperty.call(patch, 'mcpServers') ? await reloadConfiguredMcp() : await services.mcpManager.status();
+      sendEvent({ type: 'settings-updated', settings });
+      sendEvent({ type: 'mcp-status', status: mcpStatus });
+      return settings;
+    } catch (error) {
+      try {
+        await services.settingsStore.update(previous);
+        await rebuildToolSources(previous.fileRoot || app.getPath('userData'), { force: true });
+        await reloadConfiguredMcp();
+      } catch (rollbackError) {
+        services.logger.error('Settings rollback failed', { error: rollbackError?.message || String(rollbackError) });
+      }
+      throw error;
+    }
   });
   handle('settings:reset', async () => {
     if (services.globalRunId) throw new Error('Hãy dừng lượt agent trước khi reset cấu hình.');
@@ -410,8 +519,8 @@ function registerIpc() {
   handle('lm:load-model', async (_event, { id } = {}) => {
     const settings = await services.settingsStore.getInternal();
     const result = await services.lmClient.loadModel(id, {
-      contextLength: settings.contextLength || 8192,
-      flashAttention: settings.flashAttention,
+      contextLength: settings.contextLength || 2048,
+      flashAttention: settings.flashAttention !== false,
     });
     await services.settingsStore.update({ model: String(id) });
     const status = await services.lmClient.getStatus();
@@ -434,7 +543,8 @@ async function readSelectedFiles(filePaths) {
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat?.isFile()) continue;
     const base = { path: filePath, name: path.basename(filePath), size: stat.size, truncated: false };
-    rememberRevealPath(filePath);
+    const canonical = await canonicalExistingPath(filePath);
+    rememberRevealPath(canonical || filePath);
     if (stat.size > MAX_ATTACHMENT_BYTES) {
       const handle = await fs.open(filePath, 'r');
       try {
@@ -507,6 +617,9 @@ function createWindow() {
   mainWindow.webContents.on('will-redirect', (event, url) => {
     if (url !== approvedRendererUrl) event.preventDefault();
   });
+  mainWindow.webContents.on('will-frame-navigate', (event, url) => {
+    if (url !== approvedRendererUrl) event.preventDefault();
+  });
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
@@ -534,6 +647,9 @@ app.whenReady().then(async () => {
     await initializeServices();
   } catch (error) {
     dialog.showErrorBox('Không thể khởi tạo CodePilot Local', error?.stack || error?.message || String(error));
+    quitReady = true;
+    app.exit(1);
+    return;
   }
   registerIpc();
   createWindow();
@@ -562,12 +678,23 @@ app.whenReady().then(async () => {
   app.quit();
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (quitReady) return;
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
   if (statusTimer) clearInterval(statusTimer);
   for (const controller of services?.runs?.values() || []) controller.abort();
   services?.interactions?.cancelAll('Application is closing.');
-  void services?.systemTools?.stop?.();
-  void services?.mcpManager?.stop?.();
+  const cleanup = Promise.allSettled([
+    Promise.resolve(services?.systemTools?.stop?.()),
+    Promise.resolve(services?.mcpManager?.stop?.()),
+  ]);
+  const timeout = new Promise((resolve) => setTimeout(resolve, 5000));
+  void Promise.race([cleanup, timeout]).finally(() => {
+    quitReady = true;
+    app.quit();
+  });
 });
 
 function abortError() {

@@ -132,9 +132,10 @@ test('run_command aborts through the child process and caps very large output', 
     const controller = new AbortController();
     const aborted = tools.execute('run_command', { command: 'long-running' }, { signal: controller.signal });
     controller.abort();
-    const abortedResult = await aborted;
-    assert.equal(abortedResult.ok, false);
-    assert.match(abortedResult.error, /abort/i);
+    await assert.rejects(
+      aborted,
+      (error) => error?.name === 'AbortError' && error?.code === 'ABORT_ERR',
+    );
     assert.equal(children[0].killCalls[0], 'SIGKILL');
 
     const largeChild = fakeChild(4400);
@@ -277,6 +278,210 @@ test('open_path is workspace-scoped and system_info excludes environment dumps',
     assert.equal('home' in info.data, false);
     const time = await tools.execute('current_time', {});
     assert.match(time.data.iso, /^\d{4}-\d{2}-\d{2}T/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('child processes receive only minimal inherited and explicitly configured environment', async () => {
+  const root = tempWorkspace();
+  const names = ['PATH', 'SystemRoot', 'ComSpec', 'DATABASE_URL', 'OPENAI_API_KEY'];
+  const previous = new Map(names.map((name) => [name, process.env[name]]));
+  const calls = [];
+  try {
+    process.env.PATH = '/minimal/bin';
+    process.env.SystemRoot = 'C:\\Windows';
+    process.env.ComSpec = 'C:\\Windows\\System32\\cmd.exe';
+    process.env.DATABASE_URL = 'postgres://secret';
+    process.env.OPENAI_API_KEY = 'do-not-inherit';
+    const tools = new SystemTools(
+      { root, logDir: path.join(root, 'logs'), platform: 'linux', env: { CONFIGURED_FOR_TEST: 'kept' } },
+      {
+        spawn: (command, options) => {
+          calls.push({ command, options });
+          const child = fakeChild();
+          queueMicrotask(() => child.emit('close', 0, null));
+          return child;
+        },
+      },
+    );
+    const result = await tools.execute('run_command', { command: 'fake-command' });
+    assert.equal(result.ok, true);
+    const env = calls[0].options.env;
+    assert.equal(env.PATH, '/minimal/bin');
+    assert.equal(env.SystemRoot, 'C:\\Windows');
+    assert.equal(env.ComSpec, 'C:\\Windows\\System32\\cmd.exe');
+    assert.equal(env.CONFIGURED_FOR_TEST, 'kept');
+    assert.equal(env.DATABASE_URL, undefined);
+    assert.equal(env.OPENAI_API_KEY, undefined);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Windows process control uses taskkill for the complete process tree', async () => {
+  const root = tempWorkspace();
+  const calls = [];
+  let primary = null;
+  try {
+    const spawn = (command, args, options) => {
+      calls.push({ command, args, options });
+      const child = fakeChild(6000 + calls.length);
+      if (command === 'taskkill') {
+        queueMicrotask(() => {
+          child.emit('close', 0, null);
+          if (primary) primary.emit('close', null, 'SIGTERM');
+        });
+      }
+      if (command !== 'taskkill') primary = child;
+      return child;
+    };
+    const tools = new SystemTools(
+      { root, logDir: path.join(root, 'logs'), platform: 'win32', terminationTimeoutMs: 500 },
+      { spawn },
+    );
+    const started = await tools.execute('start_process', { command: 'fake-server' });
+    assert.equal(started.ok, true);
+    const stopped = await tools.execute('stop_process', { id: started.data.id });
+    assert.equal(stopped.ok, true);
+    const taskkill = calls.find((call) => call.command === 'taskkill');
+    assert.ok(taskkill);
+    assert.deepEqual(taskkill.args, ['/PID', String(primary.pid), '/T', '/F']);
+    assert.equal(taskkill.options.shell, false);
+    assert.equal(taskkill.options.detached, false);
+    assert.equal(stopped.data.process.terminationConfirmed, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an unconfirmed process-tree stop is reported without claiming completion', async () => {
+  const root = tempWorkspace();
+  let primary = null;
+  try {
+    const spawn = (command) => {
+      const child = fakeChild(command === 'taskkill' ? 7001 : 7000);
+      if (command !== 'taskkill') primary = child;
+      return child;
+    };
+    const tools = new SystemTools(
+      { root, logDir: path.join(root, 'logs'), platform: 'win32', terminationTimeoutMs: 30 },
+      { spawn },
+    );
+    const started = await tools.execute('start_process', { command: 'fake-server' });
+    const stopped = await tools.execute('stop_process', { id: started.data.id, force: true });
+    assert.equal(stopped.ok, false);
+    assert.equal(stopped.data.stopped, false);
+    assert.equal(stopped.data.process.status, 'terminationUnconfirmed');
+    assert.equal(stopped.data.process.terminationConfirmed, false);
+    assert.ok(primary);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('AbortError is rethrown across command, git, and external open boundaries', async () => {
+  const root = tempWorkspace();
+  try {
+    let childKilled = false;
+    const tools = new SystemTools(
+      { root, logDir: path.join(root, 'logs'), platform: 'linux' },
+      {
+        execFile: () => ({ kill: () => { childKilled = true; } }),
+      },
+    );
+    const controller = new AbortController();
+    const pending = tools.execute('git_status', {}, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(
+      pending,
+      (error) => error?.name === 'AbortError' && error?.code === 'ABORT_ERR',
+    );
+    assert.equal(childKilled, true);
+
+    const openController = new AbortController();
+    let openCallbackStarted = false;
+    const openTools = new SystemTools({
+      root,
+      logDir: path.join(root, 'open-logs'),
+      platform: 'linux',
+      openPath: () => {
+        openCallbackStarted = true;
+        return new Promise(() => {});
+      },
+    });
+    fs.writeFileSync(path.join(root, 'open.txt'), 'safe');
+    const openPending = openTools.execute('open_path', { path: 'open.txt' }, { signal: openController.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(openCallbackStarted, true);
+    openController.abort();
+    await assert.rejects(
+      openPending,
+      (error) => error?.name === 'AbortError',
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('open_path rejects symlink escapes and revalidates before opening', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('symlink creation is not consistently available on Windows');
+    return;
+  }
+  const root = tempWorkspace();
+  const outside = tempWorkspace();
+  try {
+    fs.writeFileSync(path.join(root, 'inside.txt'), 'inside');
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
+    const link = path.join(root, 'link');
+    fs.symlinkSync(outside, link, 'dir');
+    let opened = 0;
+    const tools = new SystemTools({
+      root,
+      logDir: path.join(root, 'logs'),
+      platform: 'linux',
+      openPath: () => { opened += 1; },
+    });
+    const escaped = await tools.execute('open_path', { path: 'link/secret.txt' });
+    assert.equal(escaped.ok, false);
+    assert.equal(opened, 0);
+
+    fs.unlinkSync(link);
+    fs.symlinkSync(path.join(root, 'inside.txt'), link, 'file');
+    const raced = new SystemTools({
+      root,
+      logDir: path.join(root, 'race-logs'),
+      platform: 'linux',
+      openPath: () => {
+        fs.unlinkSync(link);
+        fs.symlinkSync(outside, link, 'dir');
+      },
+    });
+    const changed = await raced.execute('open_path', { path: 'link' });
+    assert.equal(changed.ok, false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('stale process logs are bounded on disk', () => {
+  const root = tempWorkspace();
+  const logDir = path.join(root, 'logs');
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+    for (let index = 0; index < 270; index += 1) {
+      fs.writeFileSync(path.join(logDir, `proc_stale${index}.log`), 'x');
+    }
+    // Construction performs cleanup without executing a child process.
+    new SystemTools({ root, logDir, platform: 'linux' });
+    const remaining = fs.readdirSync(logDir).filter((name) => /^proc_.*\.log$/.test(name));
+    assert.ok(remaining.length <= 256);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

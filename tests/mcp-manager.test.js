@@ -19,6 +19,10 @@ function fakeHttpResponse(body, { status = 200, headers = {} } = {}) {
   };
 }
 
+function publicLookup() {
+  return async () => [{ address: '93.184.216.34', family: 4 }];
+}
+
 function makeFakeStdio(tools = [{ name: 'echo', description: 'Echo text', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false } }]) {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -38,7 +42,7 @@ function makeFakeStdio(tools = [{ name: 'echo', description: 'Echo text', inputS
           child.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { content: [
             { type: 'text', text: `echo:${message.params.arguments.text}` },
             { type: 'image', data: 'base64-secret-should-not-pass', mimeType: 'image/png' },
-            { type: 'resource', resource: { text: 'resource text' } },
+            { type: 'resource', resource: { text: `resource text${child.resourceText ? ` ${child.resourceText}` : ''}` } },
           ] } })}\n`);
         }
         // notifications/initialized intentionally has no response.
@@ -130,7 +134,7 @@ test('streamable HTTP lifecycle handles JSON, 202 notifications, sessions, and S
     }
     return fakeHttpResponse(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: 'ok' }] } }), { headers: { 'content-type': 'application/json' } });
   };
-  const manager = new McpManager({ fetchImpl, requestTimeout: 2_000 });
+  const manager = new McpManager({ fetchImpl, lookup: publicLookup(), requestTimeout: 2_000 });
   manager.addConfig('http', { type: 'http', url: 'https://mcp.example.test/mcp', headers: { 'X-Client': 'test' } });
   await manager.start();
   assert.equal(manager.status().servers.http.status, 'running');
@@ -141,5 +145,92 @@ test('streamable HTTP lifecycle handles JSON, 202 notifications, sessions, and S
   assert.equal(called.ok, true);
   assert.match(called.data.text, /ok/);
   assert.equal(callCount, 4);
+  await manager.stop();
+});
+
+test('MCP HTTP rejects private targets by default and requires an explicit opt-in', async () => {
+  let fetchCalls = 0;
+  const fetchImpl = async () => {
+    fetchCalls += 1;
+    return fakeHttpResponse(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [] } }));
+  };
+  const blockedLiteral = new McpManager({ fetchImpl, lookup: publicLookup(), requestTimeout: 100 });
+  assert.throws(() => blockedLiteral.addConfig('literal', { type: 'http', url: 'http://127.0.0.1:43123/mcp' }), /allowPrivateNetwork/);
+
+  const blockedDns = new McpManager({
+    fetchImpl,
+    lookup: async () => [{ address: '10.0.0.8', family: 4 }],
+    requestTimeout: 100,
+    startupTimeout: 200,
+  });
+  blockedDns.addConfig('dns', { type: 'http', url: 'https://mcp.example.test/mcp' });
+  await blockedDns.start();
+  assert.equal(blockedDns.status().servers.dns.status, 'error');
+  assert.match(blockedDns.status().servers.dns.error, /private|reserved|allowPrivateNetwork/i);
+  assert.equal(fetchCalls, 0);
+
+  const allowed = new McpManager({
+    fetchImpl: async (_url, options) => {
+      fetchCalls += 1;
+      const body = JSON.parse(options.body);
+      if (body.method === 'initialize') return fakeHttpResponse(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-06-18' } }), { headers: { 'content-type': 'application/json' } });
+      if (body.method === 'notifications/initialized') return fakeHttpResponse('', { status: 202 });
+      return fakeHttpResponse(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { tools: [{ name: 'local', inputSchema: { type: 'object', properties: {} } }] } }), { headers: { 'content-type': 'application/json' } });
+    },
+    lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    requestTimeout: 100,
+    startupTimeout: 200,
+  });
+  allowed.addConfig('local', { type: 'http', url: 'http://127.0.0.1:43123/mcp', allowPrivateNetwork: true });
+  await allowed.start();
+  assert.equal(allowed.status().servers.local.status, 'running');
+  assert.equal(allowed.definitions()[0].function.name, 'mcp__local__local');
+  await allowed.stop();
+});
+
+test('stdio MCP receives a minimal environment plus explicitly configured values', async () => {
+  const child = makeFakeStdio();
+  let options;
+  const previousSecret = process.env.CODER_LOCAL_MCP_TEST_SECRET;
+  process.env.CODER_LOCAL_MCP_TEST_SECRET = 'must-not-be-inherited';
+  try {
+    const manager = new McpManager({
+      spawnImpl: (_command, _args, spawnOptions) => {
+        options = spawnOptions;
+        return child;
+      },
+      requestTimeout: 1_000,
+    });
+    manager.addConfig('stdio', { command: 'fake', env: { MCP_CONFIGURED_VALUE: 'kept' } });
+    await manager.start();
+    assert.equal(options.env.MCP_CONFIGURED_VALUE, 'kept');
+    assert.equal(options.env.CODER_LOCAL_MCP_TEST_SECRET, undefined);
+    for (const name of ['PATH', 'Path', 'SYSTEMROOT', 'SystemRoot', 'COMSPEC', 'ComSpec']) {
+      if (process.env[name] !== undefined) {
+        const preserved = Object.keys(options.env).some((key) => key.toLowerCase() === name.toLowerCase());
+        assert.equal(preserved, true, name);
+      }
+    }
+    await manager.stop();
+  } finally {
+    if (previousSecret === undefined) delete process.env.CODER_LOCAL_MCP_TEST_SECRET;
+    else process.env.CODER_LOCAL_MCP_TEST_SECRET = previousSecret;
+  }
+});
+
+test('MCP configured secrets are scrubbed from text and resource results', async () => {
+  const secret = 'configured-resource-secret';
+  const child = makeFakeStdio();
+  child.resourceText = secret;
+  const manager = new McpManager({
+    spawnImpl: () => child,
+    requestTimeout: 1_000,
+  });
+  manager.addConfig('redact', { command: 'fake', env: { MCP_SECRET: secret } });
+  await manager.start();
+  const definition = manager.definitions()[0];
+  const result = await manager.execute(definition.function.name, { text: secret });
+  assert.equal(result.ok, true);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
   await manager.stop();
 });

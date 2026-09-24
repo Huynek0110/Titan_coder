@@ -31,6 +31,19 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function restoreRedactedPlaceholders(current, incoming) {
+  if (incoming === '[REDACTED]') return current === undefined ? incoming : current;
+  if (Array.isArray(incoming)) {
+    return incoming.map((item, index) => restoreRedactedPlaceholders(Array.isArray(current) ? current[index] : undefined, item));
+  }
+  if (!isObject(incoming)) return incoming;
+  const output = {};
+  for (const [key, value] of Object.entries(incoming)) {
+    output[key] = restoreRedactedPlaceholders(isObject(current) ? current[key] : undefined, value);
+  }
+  return output;
+}
+
 function defaultState() {
   return {
     settings: sanitizeSettings(DEFAULT_SETTINGS),
@@ -345,6 +358,9 @@ class SettingsStore {
     return this._enqueue(async () => {
       if (!this._loaded) await this._loadUnlocked();
       const validated = validateSettingsPatch(patch, this._state.settings);
+      if (Object.prototype.hasOwnProperty.call(validated, 'mcpServers')) {
+        validated.mcpServers = restoreRedactedPlaceholders(this._state.settings.mcpServers, validated.mcpServers);
+      }
       this._state.settings = sanitizeSettings({ ...this._state.settings, ...validated });
       if (Object.prototype.hasOwnProperty.call(validated, SECRET_KEY)) {
         const secret = validated[SECRET_KEY];

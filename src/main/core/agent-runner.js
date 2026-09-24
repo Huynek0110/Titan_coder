@@ -9,6 +9,7 @@ const {
   isMutatingTool,
   isMcpTool,
   isReadOnlyTool,
+  approvalRequired,
 } = require('./tool-broker');
 
 const WORKSPACE_TOOLS = new Set([
@@ -710,7 +711,7 @@ class AgentRunner {
       budget.steps += 1;
       this.emit({ type: 'agent-stage', runId, phase: subagent ? 'subagent-thinking' : 'thinking', step, maxSteps, subagentId: subagent?.id });
       let selected = this.broker.selectDefinitions(text, mode, {
-        maxTools: settings.maxToolsPerTurn || (mode === 'chat' ? 5 : 9),
+        maxTools: settings.maxToolsPerTurn || (mode === 'chat' ? 4 : 6),
         includeMcp: settings.enableMcp !== false,
         subagent: Boolean(subagent),
       });
@@ -990,7 +991,7 @@ class AgentRunner {
       const fallbackReadOnly = isReadOnlyTool(name, definition);
       const approvalMode = String(safeSettings.approvalMode || 'automatic').toLowerCase();
       const fallbackToolsAllowed = safeSettings.allowFallbackTools === true;
-      if ((mcp || !fallbackReadOnly) && !fallbackToolsAllowed && approvalMode !== 'ask') {
+      if ((mcp || !fallbackReadOnly) && !fallbackToolsAllowed && !approvalRequired(approvalMode)) {
         return { ok: false, summary: 'Fallback tool bị từ chối', error: 'Bật allowFallbackTools cho Qwen fallback hoặc dùng approval mode ask.' };
       }
     }
@@ -1005,6 +1006,7 @@ class AgentRunner {
         question: String(args.value.question).slice(0, 2000),
         reason: String(args.value.reason || '').slice(0, 1000),
         options: Array.isArray(args.value.options) ? args.value.options.slice(0, 4).map(String) : [],
+        runId,
         signal,
       });
       return { ok: true, summary: 'Đã nhận câu trả lời', data: { answer: String(answer || '').slice(0, 8000) } };

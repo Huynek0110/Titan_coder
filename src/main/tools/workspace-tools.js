@@ -27,6 +27,26 @@ const MAX_WRITE_BYTES = 10 * 1024 * 1024;
 const SEARCH_FILE_BYTES = 512 * 1024;
 const SEARCH_TOTAL_BYTES = 20 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES_SCANNED = 10_000;
+const MAX_PATTERN_LENGTH = 512;
+const MAX_REGEX_PATTERN_LENGTH = 512;
+const MAX_GLOB_INPUT_LENGTH = 4096;
+const MAX_GLOB_CACHE_ENTRIES = 128;
+const MAX_REGEX_QUANTIFIERS = 64;
+const MAX_REGEX_GROUPS = 128;
+const MAX_REGEX_REPETITION = 1_000;
+const MAX_SECRET_POLICY_SCAN_CHARS = MAX_READ_BYTES;
+const SENSITIVE_REDACTION = '[REDACTED]';
+const SENSITIVE_FILE_ERROR = 'Sensitive file access is blocked by workspace policy.';
+const SENSITIVE_CONFIG_EXTENSIONS = new Set([
+  '.json', '.json5', '.yaml', '.yml', '.toml', '.ini', '.conf', '.cfg', '.properties', '.config',
+]);
+const SENSITIVE_DIRECTORY_NAMES = new Set([
+  '.env', '.secrets', '.secret', 'secrets', 'secret', '.credentials', 'credentials',
+]);
+const PRIVATE_KEY_HEADER_RE = /-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----/i;
+const SENSITIVE_CONFIG_VALUE_RE = /["']?(?:authorization|cookie|set[_-]?cookie|password|passwd|pwd|secret|secrets?|credentials?|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key)["']?\s*[:=]\s*["']?[^"',}\]\s]+/i;
+const SENSITIVE_CONFIG_KEY_PART_RE = /(?:^|[_-])(?:password|passwd|pwd|secret|secrets?|credentials?|token|api[_-]?key|apikey|access[_-]?key|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key)(?:$|[_-])/i;
+const SENSITIVE_CONFIG_FILE_RE = /^(?:secret|secrets|credential|credentials)(?:[._-](?:txt|json5?|ya?ml|toml|ini|conf|cfg|properties|config|bak|backup|old|enc|encrypted))?$/i;
 
 const READ_ONLY_TOOLS = new Set([
   'list_directory',
@@ -55,6 +75,38 @@ function errorMessage(error) {
   } catch {
     return 'Unknown error';
   }
+}
+
+function isAbortError(error) {
+  return Boolean(error && (error.name === 'AbortError' || error.code === 'ABORT_ERR'));
+}
+
+function createAbortError() {
+  const error = new Error('Workspace operation was cancelled.');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted === true) throw createAbortError();
+}
+
+function getSignal(context) {
+  return context && context.signal ? context.signal : null;
+}
+
+function allowsSecretRead(context) {
+  return Boolean(
+    context &&
+    Object.prototype.hasOwnProperty.call(context, 'allowSecretRead') &&
+    context.allowSecretRead === true,
+  );
+}
+
+function markSensitiveFileSkipped(state) {
+  if (!state) return;
+  state.sensitiveFilesSkipped = (state.sensitiveFilesSkipped || 0) + 1;
 }
 
 function isInside(root, candidate) {
@@ -89,12 +141,88 @@ function isIgnoredLocation(root, target) {
 }
 
 function isSensitiveFile(filePath) {
-  const name = path.basename(filePath).toLowerCase();
-  if (name === '.env' || name.startsWith('.env.') || name === '.envrc') return true;
-  if (name === '.npmrc' || name === '.pypirc' || name === '.netrc') return true;
-  if (name === 'credentials' || name.startsWith('credentials.') || name === 'secrets' || name.startsWith('secrets.')) return true;
-  if (/^id_(rsa|dsa|ecdsa|ed25519)$/.test(name)) return true;
-  return /\.(pem|key|p12|pfx|jks|keystore)$/.test(name);
+  if (typeof filePath !== 'string' || filePath.length === 0) return false;
+  const parts = filePath.split(/[\\/]+/).filter(Boolean).map((part) => part.toLowerCase());
+  const name = parts[parts.length - 1] || '';
+  const parentParts = parts.slice(0, -1);
+  const extension = path.extname(name).toLowerCase();
+
+  if (name === '.env' || name.startsWith('.env.') || name.endsWith('.env') || name === '.envrc') return true;
+  if (name === '.npmrc' || name === '.pypirc' || name === '.netrc' || name === '.pgpass' || name === '.git-credentials') return true;
+  if (SENSITIVE_DIRECTORY_NAMES.has(name)) return true;
+  if (parentParts.some((part) => SENSITIVE_DIRECTORY_NAMES.has(part))) return true;
+  if (/(?:^|[._-])id_(?:rsa|dsa|ecdsa|ed25519)(?:[._-]|$)/.test(name)) return true;
+  if (/(?:^|[._-])private[_-]?key(?:[._-]|$)/.test(name)) return true;
+  if (SENSITIVE_CONFIG_FILE_RE.test(name)) return true;
+  if (/\.(?:secret|secrets|credential|credentials)$/.test(name)) return true;
+  if (name.startsWith('credentials.') || name.startsWith('secrets.')) return true;
+  if (/\.(?:pem|key|p12|pfx|pkcs8|pkcs12|sec1|jks|jceks|keystore|keytab|ppk|kdbx)$/.test(name)) return true;
+
+  // Do not block every config file: ordinary project configuration is useful
+  // to coding agents.  Config files with an explicit secret marker are treated
+  // as sensitive, and content is checked separately after a bounded read.
+  if (
+    SENSITIVE_CONFIG_EXTENSIONS.has(extension) &&
+    /(?:secret|credential|password|passwd|token|api[_-]?key|private[_-]?key)/i.test(name)
+  ) return true;
+
+  return false;
+}
+
+function isConfigKeyCharacter(character) {
+  return Boolean(character) && /[A-Za-z0-9_.\- "' ]/.test(character);
+}
+
+function hasSensitiveConfigKey(text, signal) {
+  throwIfAborted(signal);
+  if (!/(?:password|passwd|pwd|secret|credentials?|token|key)/i.test(text)) return false;
+  let assignments = 0;
+  const limit = Math.min(text.length, MAX_SECRET_POLICY_SCAN_CHARS);
+  for (let index = 0; index < limit; index += 1) {
+    if ((index & 1023) === 0) throwIfAborted(signal);
+    if (text[index] !== ':' && text[index] !== '=') continue;
+    assignments += 1;
+    if (assignments > 4096) break;
+    const lowerBound = Math.max(0, index - 256);
+    let start = index;
+    while (start > lowerBound && isConfigKeyCharacter(text[start - 1])) start -= 1;
+    const key = text.slice(start, index).trim().replace(/^["']|["']$/g, '');
+    if (!key || key.length > 256) continue;
+    const normalized = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+    if (SENSITIVE_CONFIG_KEY_PART_RE.test(normalized)) return true;
+  }
+  return false;
+}
+
+function isSensitiveContent(filePath, text, signal) {
+  throwIfAborted(signal);
+  if (typeof text !== 'string' || text.length === 0) return false;
+  if (PRIVATE_KEY_HEADER_RE.test(text)) return true;
+  if (!isSensitiveFile(filePath)) {
+    const name = path.basename(filePath).toLowerCase();
+    const extension = path.extname(name).toLowerCase();
+    const configLike = SENSITIVE_CONFIG_EXTENSIONS.has(extension) ||
+      /(?:^|[._-])(?:config|settings)(?:[._-]|$)/.test(name);
+    if (!configLike) return false;
+  }
+  const sensitive = hasSensitiveConfigKey(text, signal) || SENSITIVE_CONFIG_VALUE_RE.test(text);
+  throwIfAborted(signal);
+  return sensitive;
+}
+
+function sensitiveReadResult(root, target) {
+  const relative = displayPath(root, target);
+  return {
+    ok: false,
+    summary: `Blocked sensitive file ${relative}`,
+    data: {
+      path: relative,
+      blocked: true,
+      redacted: true,
+      content: SENSITIVE_REDACTION,
+    },
+    error: `${SENSITIVE_FILE_ERROR} (${relative})`,
+  };
 }
 
 function isLikelyBinary(buffer) {
@@ -122,18 +250,21 @@ function decodeUtf8(buffer) {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
-function splitTextLines(text) {
+function splitTextLines(text, signal) {
+  throwIfAborted(signal);
   if (text.length === 0) return [];
   const lines = text.split(/\r\n|\n|\r/);
   if (lines[lines.length - 1] === '') lines.pop();
+  throwIfAborted(signal);
   return lines;
 }
 
-function splitLineRecords(text) {
+function splitLineRecords(text, signal) {
   const records = [];
   let offset = 0;
 
   while (offset < text.length) {
+    throwIfAborted(signal);
     const newline = text.indexOf('\n', offset);
     if (newline === -1) {
       records.push({ text: text.slice(offset), ending: '' });
@@ -159,7 +290,38 @@ function hasGlobSyntax(value) {
   return /[*?[\]]/.test(value);
 }
 
+function looksUnsafeGlob(glob) {
+  if (typeof glob !== 'string' || glob.length > MAX_PATTERN_LENGTH) return true;
+  let wildcardCount = 0;
+  for (const character of glob) {
+    if (character === '*' || character === '?') wildcardCount += 1;
+  }
+  if (wildcardCount > 64) return true;
+  if ((glob.match(/\*{3,}/g) || []).some((run) => run.length > 8)) return true;
+  if (/\[[^\]]{80,}\]/.test(glob)) return true;
+
+  // A long chain of adjacent wildcard atoms creates an equivalent ambiguous
+  // regular expression.  A small number of wildcards (including **/*.js)
+  // remains fully supported.
+  const adjacentWildcards = /(?:\*{1,2}|\?)[^/]{0,16}(?:\*{1,2}|\?)(?:[^/]{0,16}(?:\*{1,2}|\?)){3,}/;
+  return adjacentWildcards.test(glob);
+}
+
+const GLOB_REGEXP_CACHE = new Map();
+
 function globToRegExp(glob) {
+  if (typeof glob !== 'string' || glob.length === 0) {
+    throw new TypeError('Glob pattern must be a non-empty string.');
+  }
+  if (glob.length > MAX_PATTERN_LENGTH) {
+    throw new RangeError(`Glob pattern must be at most ${MAX_PATTERN_LENGTH} characters.`);
+  }
+  if (looksUnsafeGlob(glob)) {
+    throw new Error('The glob pattern appears unsafe or computationally expensive.');
+  }
+  const cached = GLOB_REGEXP_CACHE.get(glob);
+  if (cached) return cached;
+
   const normalized = glob.replace(/\\/g, '/');
   let source = '^';
 
@@ -184,10 +346,27 @@ function globToRegExp(glob) {
       continue;
     }
     if (character === '[') {
-      const closing = normalized.indexOf(']', index + 1);
-      if (closing !== -1) {
+      let closing = index + 1;
+      let escaped = false;
+      while (closing < normalized.length) {
+        if (!escaped && normalized[closing] === ']') break;
+        escaped = !escaped && normalized[closing] === '\\';
+        if (normalized[closing] !== '\\') escaped = false;
+        closing += 1;
+      }
+      if (closing < normalized.length) {
         let content = normalized.slice(index + 1, closing);
         if (content.startsWith('!')) content = `^${content.slice(1)}`;
+        if (content.length === 0 || content.length > 80 || /[\r\n]/.test(content)) {
+          throw new Error('The glob character class is invalid or too large.');
+        }
+        try {
+          // Compile the class once here so malformed user input fails before
+          // the walk begins rather than for every filesystem entry.
+          new RegExp(`[${content}]`, 'i');
+        } catch {
+          throw new Error('The glob character class is invalid.');
+        }
         source += `[${content}]`;
         index = closing;
         continue;
@@ -197,10 +376,27 @@ function globToRegExp(glob) {
   }
 
   source += '$';
-  return new RegExp(source, 'i');
+  let expression;
+  try {
+    expression = new RegExp(source, 'i');
+  } catch {
+    throw new Error('The glob pattern is invalid.');
+  }
+  if (GLOB_REGEXP_CACHE.size >= MAX_GLOB_CACHE_ENTRIES) {
+    const first = GLOB_REGEXP_CACHE.keys().next().value;
+    GLOB_REGEXP_CACHE.delete(first);
+  }
+  GLOB_REGEXP_CACHE.set(glob, expression);
+  return expression;
 }
 
 function matchesGlob(relativePath, basename, pattern) {
+  if (
+    typeof relativePath !== 'string' ||
+    typeof basename !== 'string' ||
+    relativePath.length > MAX_GLOB_INPUT_LENGTH ||
+    basename.length > MAX_GLOB_INPUT_LENGTH
+  ) return false;
   const expression = globToRegExp(pattern);
   if (pattern.includes('/') || pattern.includes('\\')) {
     return expression.test(relativePath);
@@ -277,18 +473,21 @@ function compactText(value, maximum = 500) {
   return redacted.length > maximum ? `${redacted.slice(0, maximum - 1)}…` : redacted;
 }
 
-function lineStartIndexes(text) {
+function lineStartIndexes(text, signal) {
   const starts = [0];
   for (let index = 0; index < text.length; index += 1) {
+    if ((index & 1023) === 0) throwIfAborted(signal);
     if (text[index] === '\n') starts.push(index + 1);
   }
+  throwIfAborted(signal);
   return starts;
 }
 
-function lineNumberForOffset(starts, offset) {
+function lineNumberForOffset(starts, offset, signal) {
   let low = 0;
   let high = starts.length - 1;
   while (low <= high) {
+    throwIfAborted(signal);
     const middle = (low + high) >> 1;
     if (starts[middle] <= offset) low = middle + 1;
     else high = middle - 1;
@@ -296,8 +495,225 @@ function lineNumberForOffset(starts, offset) {
   return high + 1;
 }
 
+function hasAmbiguousRepeatedAlternation(pattern) {
+  const splitAlternatives = (content) => {
+    const branches = [];
+    let start = 0;
+    let depth = 0;
+    let escaped = false;
+    let inClass = false;
+    for (let index = 0; index < content.length; index += 1) {
+      const character = content[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (inClass) {
+        if (character === ']') inClass = false;
+        continue;
+      }
+      if (character === '[') {
+        inClass = true;
+        continue;
+      }
+      if (character === '(') depth += 1;
+      else if (character === ')') depth = Math.max(0, depth - 1);
+      else if (character === '|' && depth === 0) {
+        branches.push(content.slice(start, index));
+        start = index + 1;
+      }
+    }
+    branches.push(content.slice(start));
+    return branches;
+  };
+
+  for (let start = 0; start < pattern.length; start += 1) {
+    if (pattern[start] !== '(') continue;
+    let depth = 0;
+    let escaped = false;
+    let inClass = false;
+    let close = -1;
+    for (let index = start; index < pattern.length; index += 1) {
+      const character = pattern[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (inClass) {
+        if (character === ']') inClass = false;
+        continue;
+      }
+      if (character === '[') {
+        inClass = true;
+        continue;
+      }
+      if (character === '(') depth += 1;
+      else if (character === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          close = index;
+          break;
+        }
+      }
+    }
+    if (close === -1) continue;
+    let quantifierIndex = close + 1;
+    while (/\s/.test(pattern[quantifierIndex] || '')) quantifierIndex += 1;
+    const quantifier = pattern[quantifierIndex];
+    const repeated = quantifier === '*' || quantifier === '+' || quantifier === '?' ||
+      (quantifier === '{' && /^\{\d+(?:,\d*)?\}/.test(pattern.slice(quantifierIndex)));
+    if (!repeated) continue;
+    const branches = splitAlternatives(pattern.slice(start + 1, close));
+    for (let leftIndex = 0; leftIndex < branches.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < branches.length; rightIndex += 1) {
+        const left = branches[leftIndex].replace(/^\?[:=!]/, '');
+        const right = branches[rightIndex].replace(/^\?[:=!]/, '');
+        if (!left || !right) return true;
+        if (
+          left === '.' || right === '.' ||
+          /\\[wWsSdD]/.test(left) || /\\[wWsSdD]/.test(right)
+        ) return true;
+        if (left.startsWith(right) || right.startsWith(left)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function hasRepeatedSimpleQuantifier(pattern) {
+  for (let index = 0; index < pattern.length - 1; index += 1) {
+    const atom = pattern[index];
+    if (!/[A-Za-z0-9]/.test(atom)) continue;
+    const quantifier = pattern[index + 1];
+    if (quantifier !== '*' && quantifier !== '+') continue;
+    const limit = Math.min(pattern.length - 1, index + 10);
+    for (let cursor = index + 2; cursor < limit; cursor += 1) {
+      if (pattern[cursor] === atom && pattern[cursor + 1] === quantifier) return true;
+    }
+  }
+  return false;
+}
+
 function looksUnsafeRegex(pattern) {
-  return /\((?:\?:)?[^()]*[+*][^()]*\)\s*[+*]/.test(pattern) || /\\\d/.test(pattern);
+  if (typeof pattern !== 'string' || pattern.length > MAX_REGEX_PATTERN_LENGTH) return true;
+  if (/\\[1-9]/.test(pattern)) return true;
+  if (/(?:\.\*|\.\+)[^\r\n]{0,32}(?:\.\*|\.\+)/.test(pattern)) return true;
+  if (hasRepeatedSimpleQuantifier(pattern)) return true;
+  if (hasAmbiguousRepeatedAlternation(pattern)) return true;
+
+  const groups = [];
+  let lastGroup = null;
+  let previousWasQuantifier = false;
+  let quantifierCount = 0;
+  let inClass = false;
+
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index];
+
+    if (character === '\\') {
+      if (index + 1 < pattern.length) index += 1;
+      previousWasQuantifier = false;
+      continue;
+    }
+    if (inClass) {
+      if (character === ']') inClass = false;
+      continue;
+    }
+    if (character === '[') {
+      inClass = true;
+      previousWasQuantifier = false;
+      continue;
+    }
+
+    // Group modifiers such as (?:, (?=), and (?! are prefixes, not lazy
+    // quantifiers.  Skip them so the structural checks below remain useful.
+    if (character === '?' && pattern[index - 1] === '(') {
+      let cursor = index + 1;
+      if (pattern[cursor] === '<' && pattern[cursor + 1] !== '=' && pattern[cursor + 1] !== '!') {
+        const namedEnd = pattern.indexOf('>', cursor + 1);
+        if (namedEnd !== -1) cursor = namedEnd;
+      } else if ([':', '=', '!'].includes(pattern[cursor])) {
+        cursor += 1;
+      }
+      index = cursor;
+      previousWasQuantifier = false;
+      continue;
+    }
+
+    if (character === '(') {
+      if (groups.length >= MAX_REGEX_GROUPS) return true;
+      groups.push({ hasQuantifier: false });
+      lastGroup = null;
+      previousWasQuantifier = false;
+      continue;
+    }
+    if (character === ')') {
+      const group = groups.pop();
+      if (group) {
+        if (group.hasQuantifier) {
+          const parent = groups[groups.length - 1];
+          if (parent) parent.hasQuantifier = true;
+        }
+        lastGroup = group;
+      }
+      previousWasQuantifier = false;
+      continue;
+    }
+    if (character === '|') {
+      previousWasQuantifier = false;
+      continue;
+    }
+
+    let quantifierEnd = -1;
+    let repetition = 0;
+    if (character === '*' || character === '+' || character === '?') {
+      // A second ?/* after a quantifier is a lazy/possessive-style modifier;
+      // it is not a second repetition in the patterns accepted by JavaScript.
+      if (previousWasQuantifier) {
+        previousWasQuantifier = character === '?' || character === '*' || character === '+';
+        continue;
+      }
+      quantifierEnd = index + 1;
+    } else if (character === '{') {
+      const match = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(index));
+      if (!match) {
+        previousWasQuantifier = false;
+        continue;
+      }
+      quantifierEnd = index + match[0].length;
+      repetition = Number(match[2] === '' || match[2] === undefined ? match[1] : match[2]);
+    }
+
+    if (quantifierEnd !== -1) {
+      quantifierCount += 1;
+      if (quantifierCount > MAX_REGEX_QUANTIFIERS || repetition > MAX_REGEX_REPETITION) return true;
+      if (character === '*' || character === '+' || character === '?' || character === '{') {
+        const previousCharacter = pattern[index - 1];
+        if (previousCharacter === ')') {
+          if (lastGroup && (lastGroup.hasQuantifier)) return true;
+        } else if (previousWasQuantifier) {
+          return true;
+        }
+      }
+      const currentGroup = groups[groups.length - 1];
+      if (currentGroup) currentGroup.hasQuantifier = true;
+      previousWasQuantifier = true;
+      index = quantifierEnd - 1;
+      continue;
+    }
+
+    previousWasQuantifier = false;
+  }
+
+  return false;
 }
 
 function parseHunkHeader(line) {
@@ -353,7 +769,7 @@ function normalizePatchHeaderPath(value, stripDiffPrefix = true) {
   return process.platform === 'win32' ? filePath.toLowerCase() : filePath;
 }
 
-function parseUnifiedDiff(patch, expectedPath) {
+function parseUnifiedDiff(patch, expectedPath, signal) {
   if (typeof patch !== 'string') throw new TypeError('patch must be a string.');
   if (patch.length === 0) throw new Error('Patch is empty.');
   if (Buffer.byteLength(patch, 'utf8') > 2 * 1024 * 1024) {
@@ -371,10 +787,12 @@ function parseUnifiedDiff(patch, expectedPath) {
 
   const finishHunk = () => {
     if (!current) return;
+    throwIfAborted(signal);
     if (current.lines.length === 0) throw new Error(`Hunk ${hunks.length + 1} is empty.`);
 
     const oldCount = current.lines.filter((line) => line.kind !== '+').length;
     const newCount = current.lines.filter((line) => line.kind !== '-').length;
+    throwIfAborted(signal);
     if (current.header.oldCount !== null && oldCount !== current.header.oldCount) {
       throw new Error(
         `Hunk ${hunks.length + 1} declares ${current.header.oldCount} old lines but contains ${oldCount}.`,
@@ -386,6 +804,7 @@ function parseUnifiedDiff(patch, expectedPath) {
       );
     }
     for (let index = 0; index < current.lines.length; index += 1) {
+      throwIfAborted(signal);
       if (current.lines[index].noNewline && index !== current.lines.length - 1) {
         throw new Error(`Hunk ${hunks.length + 1} has an invalid no-newline marker.`);
       }
@@ -398,6 +817,7 @@ function parseUnifiedDiff(patch, expectedPath) {
   };
 
   for (let lineIndex = 0; lineIndex < physicalLines.length; lineIndex += 1) {
+    throwIfAborted(signal);
     const line = physicalLines[lineIndex];
     const header = parseHunkHeader(line);
     if (header) {
@@ -465,25 +885,30 @@ function parseUnifiedDiff(patch, expectedPath) {
   return hunks;
 }
 
-function hunkRecordsMatch(records, expected) {
+function hunkRecordsMatch(records, expected, signal) {
   if (records.length !== expected.length) return false;
-  return expected.every((line, index) => {
+  for (let index = 0; index < expected.length; index += 1) {
+    throwIfAborted(signal);
+    const line = expected[index];
     const record = records[index];
     if (record.text !== line.text) return false;
-    return !line.noNewline || record.ending === '';
-  });
+    if (line.noNewline && record.ending !== '') return false;
+  }
+  return true;
 }
 
-function applyParsedHunks(content, hunks) {
-  let records = splitLineRecords(content);
+function applyParsedHunks(content, hunks, signal) {
+  let records = splitLineRecords(content, signal);
   let cursor = 0;
   let relocatedHunks = 0;
   const preferredEnding = records.find((record) => record.ending)?.ending ||
     (content.includes('\r\n') ? '\r\n' : os.EOL);
 
   for (let hunkIndex = 0; hunkIndex < hunks.length; hunkIndex += 1) {
+    throwIfAborted(signal);
     const hunk = hunks[hunkIndex];
     const oldLines = hunk.lines.filter((line) => line.kind !== '+');
+    throwIfAborted(signal);
     let matchIndex;
 
     if (oldLines.length === 0) {
@@ -503,14 +928,16 @@ function applyParsedHunks(content, hunks) {
       matchIndex = -1;
       const first = Math.max(cursor, expected);
       for (let candidate = first; candidate <= records.length - oldLines.length; candidate += 1) {
-        if (hunkRecordsMatch(records.slice(candidate, candidate + oldLines.length), oldLines)) {
+        throwIfAborted(signal);
+        if (hunkRecordsMatch(records.slice(candidate, candidate + oldLines.length), oldLines, signal)) {
           matchIndex = candidate;
           break;
         }
       }
       if (matchIndex === -1) {
         for (let candidate = cursor; candidate <= records.length - oldLines.length; candidate += 1) {
-          if (hunkRecordsMatch(records.slice(candidate, candidate + oldLines.length), oldLines)) {
+          throwIfAborted(signal);
+          if (hunkRecordsMatch(records.slice(candidate, candidate + oldLines.length), oldLines, signal)) {
             matchIndex = candidate;
             break;
           }
@@ -527,6 +954,7 @@ function applyParsedHunks(content, hunks) {
     const replacement = [];
     let oldOffset = 0;
     for (const line of hunk.lines) {
+      throwIfAborted(signal);
       if (line.kind === '+') {
         let ending = line.noNewline ? '' : preferredEnding;
         if (
@@ -556,7 +984,7 @@ function applyParsedHunks(content, hunks) {
   return { content: joinLineRecords(records), relocatedHunks };
 }
 
-function extractSymbols(text, extension) {
+function extractSymbols(text, extension, signal) {
   const symbols = [];
   const seen = new Set();
 
@@ -601,8 +1029,9 @@ function extractSymbols(text, extension) {
 
   if (['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'].includes(extension)) {
     let inBlockComment = false;
-    const lines = splitTextLines(text);
+    const lines = splitTextLines(text, signal);
     for (let index = 0; index < lines.length; index += 1) {
+      throwIfAborted(signal);
       const line = lines[index];
       const trimmed = line.trim();
       if (inBlockComment) {
@@ -616,7 +1045,8 @@ function extractSymbols(text, extension) {
       if (!trimmed.startsWith('//')) extend(line, index + 1);
     }
   } else if (extension === '.py') {
-    splitTextLines(text).forEach((line, index) => {
+    splitTextLines(text, signal).forEach((line, index) => {
+      throwIfAborted(signal);
       if (/^\s*class\s+[A-Za-z_][\w]*\s*(?:\([^)]*\))?\s*:/.test(line)) {
         const name = /\bclass\s+([A-Za-z_][\w]*)/.exec(line)[1];
         add(name, 'class', index + 1, line);
@@ -626,7 +1056,8 @@ function extractSymbols(text, extension) {
       }
     });
   } else if (extension === '.go') {
-    splitTextLines(text).forEach((line, index) => {
+    splitTextLines(text, signal).forEach((line, index) => {
+      throwIfAborted(signal);
       let match = /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\(/.exec(line);
       if (match) add(match[1], 'function', index + 1, line);
       if (!(match = /^\s*type\s+([A-Za-z_][\w]*)\s+(?:struct|interface)\b/.exec(line))) {
@@ -635,7 +1066,8 @@ function extractSymbols(text, extension) {
       }
     });
   } else if (extension === '.rs') {
-    splitTextLines(text).forEach((line, index) => {
+    splitTextLines(text, signal).forEach((line, index) => {
+      throwIfAborted(signal);
       let match = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_][\w]*)/.exec(line);
       if (match) add(match[1], 'function', index + 1, line);
       if (!(match = /^\s*(?:pub(?:\([^)]*\))?\s+)?(struct|enum|trait)\s+([A-Za-z_][\w]*)/.exec(line))) {
@@ -647,7 +1079,8 @@ function extractSymbols(text, extension) {
       }
     });
   } else if (['.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.cs', '.java', '.kt', '.kts', '.php'].includes(extension)) {
-    splitTextLines(text).forEach((line, index) => {
+    splitTextLines(text, signal).forEach((line, index) => {
+      throwIfAborted(signal);
       const trimmed = line.trim();
       if (trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*')) return;
       let match = /^(?:public\s+|private\s+|protected\s+|internal\s+|static\s+|final\s+|abstract\s+|sealed\s+|data\s+)*(class|struct|interface|enum|namespace)\s+([A-Za-z_][\w]*)/.exec(trimmed);
@@ -696,8 +1129,8 @@ const TOOL_DEFINITIONS = Object.freeze({
     'find_files',
     'Find workspace files by glob pattern and/or case-insensitive name query without reading their contents.',
     {
-      pattern: { type: 'string', description: 'Glob such as **/*.ts or *.test.js.' },
-      query: { type: 'string', description: 'Case-insensitive file-name substring or glob.' },
+      pattern: { type: 'string', maxLength: 512, description: 'Glob such as **/*.ts or *.test.js.' },
+      query: { type: 'string', maxLength: 512, description: 'Case-insensitive file-name substring or glob.' },
       maxResults: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum matches (default 100).' },
     },
     [],
@@ -736,7 +1169,7 @@ const TOOL_DEFINITIONS = Object.freeze({
       path: { type: 'string', description: 'File or directory to search; defaults to workspace root.' },
       isRegex: { type: 'boolean', description: 'Treat query as a regular expression (default false).' },
       caseSensitive: { type: 'boolean', description: 'Match case exactly (default false).' },
-      include: { type: 'string', description: 'Optional path glob such as **/*.ts.' },
+      include: { type: 'string', maxLength: 512, description: 'Optional path glob such as **/*.ts.' },
       maxResults: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum matches (default 50).' },
     },
     ['query'],
@@ -818,7 +1251,7 @@ const TOOL_DEFINITIONS = Object.freeze({
     'find_symbols',
     'Find declarations in common JavaScript/TypeScript, Python, Go, Rust, and C-like source files without returning file bodies.',
     {
-      query: { type: 'string', description: 'Optional case-insensitive symbol-name filter.' },
+      query: { type: 'string', maxLength: 200, description: 'Optional case-insensitive symbol-name filter.' },
       path: { type: 'string', description: 'Optional source file or directory.' },
       maxResults: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum symbols (default 100).' },
     },
@@ -839,6 +1272,7 @@ const TOOL_DEFINITIONS = Object.freeze({
 class WorkspaceTools {
   constructor({ root, trashItem } = {}) {
     this._trashItem = undefined;
+    this._sensitivePaths = new Set();
     if (trashItem !== undefined && typeof trashItem !== 'function') {
       throw new TypeError('trashItem must be a function when provided.');
     }
@@ -868,12 +1302,29 @@ class WorkspaceTools {
     }
     if (!stats.isDirectory()) throw new Error('Workspace root must be a directory.');
 
+    const previousRoot = this._root;
     this._root = canonical;
+    if (!previousRoot || !isSamePath(previousRoot, canonical)) this._sensitivePaths.clear();
     return this;
   }
 
   getRoot() {
     return this._root;
+  }
+
+  _isSensitivePath(target) {
+    if (isSensitiveFile(target)) return true;
+    for (const sensitivePath of this._sensitivePaths) {
+      if (isSamePath(sensitivePath, target) || isInside(sensitivePath, target)) return true;
+    }
+    return false;
+  }
+
+  _rememberSensitivePath(target) {
+    if (typeof target !== 'string' || target.length === 0) return;
+    if ([...this._sensitivePaths].some((entry) => isSamePath(entry, target))) return;
+    if (this._sensitivePaths.size >= 256) this._sensitivePaths.delete(this._sensitivePaths.values().next().value);
+    this._sensitivePaths.add(path.normalize(target));
   }
 
   definitions(mode = 'agent') {
@@ -960,8 +1411,53 @@ class WorkspaceTools {
     throw new Error(`Unable to find an existing ancestor for path: ${input}`);
   }
 
-  async execute(name, args = {}, context = {}) {
+  _revalidateCanonicalPath(expected, signal, label) {
+    throwIfAborted(signal);
+    const current = this.resolveWorkspacePath(expected);
+    throwIfAborted(signal);
+    if (!isSamePath(current, expected)) {
+      throw new Error(`${label} changed while the operation was in progress.`);
+    }
+    return current;
+  }
+
+  _revalidatePathPair(target, parent, signal, label) {
+    const currentTarget = this._revalidateCanonicalPath(target, signal, `${label} target`);
+    const currentParent = this._revalidateCanonicalPath(parent, signal, `${label} parent`);
+    throwIfAborted(signal);
+    if (!isSamePath(currentParent, path.dirname(currentTarget))) {
+      throw new Error(`${label} parent changed while the operation was in progress.`);
+    }
+    return { target: currentTarget, parent: currentParent };
+  }
+
+  async _revalidateMutationPath(target, parent, signal, label, options = {}) {
+    const pair = this._revalidatePathPair(target, parent, signal, label);
+    const parentStats = await fsp.stat(pair.parent);
+    throwIfAborted(signal);
+    if (!parentStats.isDirectory()) {
+      throw new Error(`${label} parent is not a directory: ${displayPath(this._root, pair.parent)}`);
+    }
+
+    let targetStats = null;
     try {
+      targetStats = await fsp.lstat(pair.target);
+      throwIfAborted(signal);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (!(options.allowMissing === true && error.code === 'ENOENT')) throw error;
+    }
+    const finalPair = this._revalidatePathPair(target, parent, signal, label);
+    if (!isSamePath(finalPair.target, pair.target) || !isSamePath(finalPair.parent, pair.parent)) {
+      throw new Error(`${label} changed while the operation was in progress.`);
+    }
+    return { ...finalPair, targetStats };
+  }
+
+  async execute(name, args = {}, context = {}) {
+    const safeContext = context && typeof context === 'object' && !Array.isArray(context) ? context : {};
+    try {
+      throwIfAborted(safeContext.signal);
       if (typeof name !== 'string' || !Object.prototype.hasOwnProperty.call(TOOL_DEFINITIONS, name)) {
         return {
           ok: false,
@@ -973,12 +1469,10 @@ class WorkspaceTools {
       if (args === null || typeof args !== 'object' || Array.isArray(args)) {
         throw new TypeError('args must be an object.');
       }
-      if (context && context.signal && context.signal.aborted) {
-        throw new Error('Workspace operation was cancelled.');
-      }
 
       const handlers = this._handlers();
-      const result = await handlers[name](args, context || {});
+      const result = await handlers[name](args, safeContext);
+      throwIfAborted(safeContext.signal);
       if (!result || typeof result.ok !== 'boolean' || typeof result.summary !== 'string') {
         throw new Error('Workspace tool returned an invalid result.');
       }
@@ -989,6 +1483,8 @@ class WorkspaceTools {
         ...(result.error === undefined ? {} : { error: String(result.error) }),
       };
     } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (safeContext.signal && safeContext.signal.aborted === true) throw createAbortError();
       return {
         ok: false,
         summary: `${name || 'Workspace tool'} failed`,
@@ -1000,37 +1496,43 @@ class WorkspaceTools {
 
   _handlers() {
     return {
-      list_directory: (args) => this._listDirectory(args),
-      find_files: (args) => this._findFiles(args),
-      read_file: (args) => this._readFile(args),
-      read_many_files: (args) => this._readManyFiles(args),
-      search_text: (args) => this._searchText(args),
-      get_file_info: (args) => this._getFileInfo(args),
-      write_file: (args) => this._writeFile(args),
-      edit_file: (args) => this._editFile(args),
-      apply_patch: (args) => this._applyPatch(args),
-      create_directory: (args) => this._createDirectory(args),
-      move_file: (args) => this._moveFile(args),
-      delete_path: (args) => this._deletePath(args),
-      project_overview: (args) => this._projectOverview(args),
-      find_symbols: (args) => this._findSymbols(args),
-      project_map: (args) => this._projectMap(args),
+      list_directory: (args, context) => this._listDirectory(args, context),
+      find_files: (args, context) => this._findFiles(args, context),
+      read_file: (args, context) => this._readFile(args, context),
+      read_many_files: (args, context) => this._readManyFiles(args, context),
+      search_text: (args, context) => this._searchText(args, context),
+      get_file_info: (args, context) => this._getFileInfo(args, context),
+      write_file: (args, context) => this._writeFile(args, context),
+      edit_file: (args, context) => this._editFile(args, context),
+      apply_patch: (args, context) => this._applyPatch(args, context),
+      create_directory: (args, context) => this._createDirectory(args, context),
+      move_file: (args, context) => this._moveFile(args, context),
+      delete_path: (args, context) => this._deletePath(args, context),
+      project_overview: (args, context) => this._projectOverview(args, context),
+      find_symbols: (args, context) => this._findSymbols(args, context),
+      project_map: (args, context) => this._projectMap(args, context),
     };
   }
 
-  async _readLimited(target, limit) {
+  async _readLimited(target, limit, signal) {
+    throwIfAborted(signal);
     const handle = await fsp.open(target, 'r');
     try {
+      throwIfAborted(signal);
       const stats = await handle.stat();
+      throwIfAborted(signal);
       if (!stats.isFile()) throw new Error(`Not a file: ${displayPath(this._root, target)}`);
       const allocation = Math.min(stats.size, limit + 1);
       const buffer = Buffer.alloc(allocation);
       let offset = 0;
       while (offset < allocation) {
+        throwIfAborted(signal);
         const result = await handle.read(buffer, offset, allocation - offset, offset);
+        throwIfAborted(signal);
         if (result.bytesRead === 0) break;
         offset += result.bytesRead;
       }
+      throwIfAborted(signal);
       return {
         buffer: offset === buffer.length ? buffer : buffer.subarray(0, offset),
         fileSize: stats.size,
@@ -1042,8 +1544,10 @@ class WorkspaceTools {
     }
   }
 
-  async _readUtf8(target, limit) {
-    const result = await this._readLimited(target, limit);
+  async _readUtf8(target, limit, signal) {
+    throwIfAborted(signal);
+    const result = await this._readLimited(target, limit, signal);
+    throwIfAborted(signal);
     if (isLikelyBinary(result.buffer)) {
       const error = new Error(`Binary file cannot be read as text: ${displayPath(this._root, target)}`);
       error.code = 'EBINARY';
@@ -1057,7 +1561,9 @@ class WorkspaceTools {
     };
   }
 
-  async _listDirectory(args) {
+  async _listDirectory(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { fallback: '.' });
     const includeHidden = optionalBoolean(args, 'includeHidden', false);
     const target = this.resolveWorkspacePath(requestedPath);
@@ -1066,6 +1572,7 @@ class WorkspaceTools {
     }
 
     const stats = await fsp.stat(target);
+    throwIfAborted(signal);
     if (!stats.isDirectory()) throw new Error(`Not a directory: ${displayPath(this._root, target)}`);
 
     const entries = [];
@@ -1073,7 +1580,9 @@ class WorkspaceTools {
     let truncated = false;
     const handle = await fsp.opendir(target);
     try {
+      throwIfAborted(signal);
       for await (const entry of handle) {
+        throwIfAborted(signal);
         scanned += 1;
         if (scanned > MAX_DIRECTORY_ENTRIES_SCANNED) {
           truncated = true;
@@ -1091,6 +1600,7 @@ class WorkspaceTools {
       await handle.close().catch(() => {});
     }
 
+    throwIfAborted(signal);
     entries.sort((left, right) => {
       const leftDirectory = left.isDirectory() ? 0 : 1;
       const rightDirectory = right.isDirectory() ? 0 : 1;
@@ -1099,21 +1609,25 @@ class WorkspaceTools {
     const visibleEntries = entries.slice(0, MAX_LIST_ENTRIES);
 
     const dataEntries = await Promise.all(visibleEntries.map(async (entry) => {
+      throwIfAborted(signal);
       const absolute = path.join(target, entry.name);
       const type = entry.isDirectory() ? 'directory' : entry.isSymbolicLink() ? 'symlink' : entry.isFile() ? 'file' : 'other';
       const item = { name: entry.name, path: displayPath(this._root, absolute), type };
       if (entry.isFile()) {
         try {
           const itemStats = await fsp.lstat(absolute);
+          throwIfAborted(signal);
           item.size = itemStats.size;
           item.modified = itemStats.mtime.toISOString();
-        } catch {
+        } catch (error) {
+          if (isAbortError(error)) throw error;
           // The name and type are still useful if metadata disappears concurrently.
         }
       }
       return item;
     }));
 
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `Listed ${dataEntries.length} entries in ${displayPath(this._root, target)}`,
@@ -1121,12 +1635,16 @@ class WorkspaceTools {
     };
   }
 
-  async _findFiles(args) {
-    const pattern = optionalString(args, 'pattern');
-    const query = optionalString(args, 'query');
+  async _findFiles(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
+    const pattern = optionalString(args, 'pattern', { maxLength: MAX_PATTERN_LENGTH });
+    const query = optionalString(args, 'query', { maxLength: MAX_PATTERN_LENGTH });
     const maxResults = clampInteger(args.maxResults, 100, 1, MAX_RESULTS);
     if (pattern !== undefined && pattern.length === 0) throw new TypeError('pattern must not be empty when provided.');
     if (query !== undefined && query.length === 0) throw new TypeError('query must not be empty when provided.');
+    if (pattern !== undefined && hasGlobSyntax(pattern)) globToRegExp(pattern);
+    if (query !== undefined && hasGlobSyntax(query)) globToRegExp(query);
 
     const matches = (relative, basename) => {
       let matched = true;
@@ -1152,6 +1670,7 @@ class WorkspaceTools {
       fileCount: 0,
       directoryCount: 0,
       scannedEntries: 0,
+      sensitiveFilesSkipped: 0,
       truncated: false,
       stopped: false,
     };
@@ -1160,7 +1679,9 @@ class WorkspaceTools {
       maxFiles: Math.max(maxResults, 2000),
       maxDirectories: 10_000,
       followSymlinkFiles: false,
+      signal,
     }, state)) {
+      throwIfAborted(signal);
       const relative = displayPath(this._root, item.absolute);
       const basename = path.basename(relative);
       if (!matches(relative, basename)) continue;
@@ -1168,7 +1689,9 @@ class WorkspaceTools {
       if (size === undefined || size === null) {
         try {
           size = (await fsp.lstat(item.absolute)).size;
-        } catch {
+          throwIfAborted(signal);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
           size = null;
         }
       }
@@ -1180,6 +1703,7 @@ class WorkspaceTools {
       }
     }
 
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `Found ${files.length} files`,
@@ -1190,7 +1714,9 @@ class WorkspaceTools {
     };
   }
 
-  async _readFile(args) {
+  async _readFile(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const startLine = clampInteger(args.startLine, 1, 1, Number.MAX_SAFE_INTEGER);
     const endLine = clampInteger(args.endLine, startLine + 999, startLine, Number.MAX_SAFE_INTEGER);
@@ -1199,8 +1725,17 @@ class WorkspaceTools {
     }
     const maxBytes = clampInteger(args.maxBytes, DEFAULT_READ_BYTES, 1, MAX_READ_BYTES);
     const target = this.resolveWorkspacePath(requestedPath);
-    const result = await this._readUtf8(target, maxBytes);
-    const lines = splitTextLines(result.text);
+    const allowSecretRead = allowsSecretRead(context);
+    if (!allowSecretRead && this._isSensitivePath(target)) return sensitiveReadResult(this._root, target);
+
+    const verifiedTarget = this._revalidateCanonicalPath(target, signal, 'Read target');
+    const result = await this._readUtf8(verifiedTarget, maxBytes, signal);
+    if (!allowSecretRead && isSensitiveContent(verifiedTarget, result.text, signal)) {
+      this._rememberSensitivePath(verifiedTarget);
+      return sensitiveReadResult(this._root, verifiedTarget);
+    }
+    throwIfAborted(signal);
+    const lines = splitTextLines(result.text, signal);
 
     if (startLine > lines.length && result.truncated) {
       throw new Error(`startLine ${startLine} is beyond the ${maxBytes}-byte inspection limit.`);
@@ -1208,11 +1743,12 @@ class WorkspaceTools {
 
     const selected = lines.slice(startLine - 1, endLine);
     const visibleEnd = selected.length === 0 ? 0 : startLine + selected.length - 1;
+    throwIfAborted(signal);
     return {
       ok: true,
-      summary: `Read ${displayPath(this._root, target)} (${selected.length} lines)`,
+      summary: `Read ${displayPath(this._root, verifiedTarget)} (${selected.length} lines)`,
       data: {
-        path: displayPath(this._root, target),
+        path: displayPath(this._root, verifiedTarget),
         content: selected.join('\n'),
         startLine,
         endLine: visibleEnd,
@@ -1225,7 +1761,9 @@ class WorkspaceTools {
     };
   }
 
-  async _readManyFiles(args) {
+  async _readManyFiles(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     if (!Array.isArray(args.paths) || args.paths.length === 0 || args.paths.length > 50) {
       throw new TypeError('paths must be an array containing 1 to 50 paths.');
     }
@@ -1233,12 +1771,15 @@ class WorkspaceTools {
       throw new TypeError('Every path must be a non-empty string.');
     }
     const maxTotalBytes = clampInteger(args.maxTotalBytes, DEFAULT_MANY_FILES_BYTES, 1, MAX_MANY_FILES_BYTES);
+    const allowSecretRead = allowsSecretRead(context);
     const files = [];
     let remaining = maxTotalBytes;
     let totalBytes = 0;
     let allOk = true;
+    let sensitiveFilesBlocked = 0;
 
     for (const requestedPath of args.paths) {
+      throwIfAborted(signal);
       if (remaining <= 0) {
         files.push({ path: toPortablePath(requestedPath), ok: false, error: 'Shared byte budget exhausted.' });
         allOk = false;
@@ -1247,12 +1788,40 @@ class WorkspaceTools {
 
       try {
         const target = this.resolveWorkspacePath(requestedPath);
-        const result = await this._readUtf8(target, Math.min(256 * 1024, remaining));
+        if (!allowSecretRead && this._isSensitivePath(target)) {
+          sensitiveFilesBlocked += 1;
+          files.push({
+            path: displayPath(this._root, target),
+            ok: false,
+            blocked: true,
+            redacted: true,
+            content: SENSITIVE_REDACTION,
+            error: SENSITIVE_FILE_ERROR,
+          });
+          allOk = false;
+          continue;
+        }
+        const verifiedTarget = this._revalidateCanonicalPath(target, signal, 'Read target');
+        const result = await this._readUtf8(verifiedTarget, Math.min(256 * 1024, remaining), signal);
+        if (!allowSecretRead && isSensitiveContent(verifiedTarget, result.text, signal)) {
+          this._rememberSensitivePath(verifiedTarget);
+          sensitiveFilesBlocked += 1;
+          files.push({
+            path: displayPath(this._root, verifiedTarget),
+            ok: false,
+            blocked: true,
+            redacted: true,
+            content: SENSITIVE_REDACTION,
+            error: SENSITIVE_FILE_ERROR,
+          });
+          allOk = false;
+          continue;
+        }
         remaining -= result.visibleBytes;
         totalBytes += result.visibleBytes;
-        const lines = splitTextLines(result.text);
+        const lines = splitTextLines(result.text, signal);
         files.push({
-          path: displayPath(this._root, target),
+          path: displayPath(this._root, verifiedTarget),
           ok: true,
           content: result.text,
           lineCount: result.truncated ? null : lines.length,
@@ -1261,11 +1830,13 @@ class WorkspaceTools {
           encoding: 'utf8',
         });
       } catch (error) {
+        if (isAbortError(error)) throw error;
         allOk = false;
         files.push({ path: toPortablePath(requestedPath), ok: false, error: errorMessage(error) });
       }
     }
 
+    throwIfAborted(signal);
     const successCount = files.filter((file) => file.ok).length;
     return {
       ok: allOk,
@@ -1275,20 +1846,28 @@ class WorkspaceTools {
         totalBytes,
         maxTotalBytes,
         truncated: remaining <= 0 || files.some((file) => file.ok && file.truncated),
+        ...(sensitiveFilesBlocked > 0 ? { sensitiveFilesBlocked } : {}),
       },
       ...(allOk ? {} : { error: 'One or more files could not be read.' }),
     };
   }
 
-  async _searchText(args) {
-    const query = optionalString(args, 'query', { allowEmpty: false, maxLength: 512 });
+  async _searchText(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
+    const query = optionalString(args, 'query', { allowEmpty: false, maxLength: MAX_PATTERN_LENGTH });
     const requestedPath = optionalString(args, 'path', { fallback: '.' });
     const isRegex = optionalBoolean(args, 'isRegex', false);
     const caseSensitive = optionalBoolean(args, 'caseSensitive', false);
-    const include = optionalString(args, 'include');
+    const include = optionalString(args, 'include', { maxLength: MAX_PATTERN_LENGTH });
     const maxResults = clampInteger(args.maxResults, 50, 1, MAX_RESULTS);
-    if (isRegex && looksUnsafeRegex(query)) {
-      throw new Error('The regular expression appears unsafe or computationally expensive.');
+    if (isRegex) {
+      if (query.length > MAX_REGEX_PATTERN_LENGTH) {
+        throw new RangeError(`Regular expression must be at most ${MAX_REGEX_PATTERN_LENGTH} characters.`);
+      }
+      if (looksUnsafeRegex(query)) {
+        throw new Error('The regular expression appears unsafe or computationally expensive.');
+      }
     }
 
     const flags = `g${caseSensitive ? '' : 'i'}u`;
@@ -1299,12 +1878,15 @@ class WorkspaceTools {
     } catch {
       throw new Error('Invalid regular expression.');
     }
+    if (include !== undefined && hasGlobSyntax(include)) globToRegExp(include);
 
     const start = this.resolveWorkspacePath(requestedPath);
     if (isIgnoredLocation(this._root, start)) {
       throw new Error(`Ignored directory: ${displayPath(this._root, start)}`);
     }
     const startStats = await fsp.stat(start);
+    throwIfAborted(signal);
+    const allowSecretRead = allowsSecretRead(context);
     const matches = [];
     let filesScanned = 0;
     let bytesScanned = 0;
@@ -1314,13 +1896,18 @@ class WorkspaceTools {
       fileCount: 0,
       directoryCount: 0,
       scannedEntries: 0,
+      sensitiveFilesSkipped: 0,
       truncated: false,
       stopped: false,
     };
 
-    const searchFile = async (absolute) => {
+    const searchFile = async (absolute, policyPath = absolute) => {
       if (stopped) return;
-      if (isSensitiveFile(absolute)) return;
+      throwIfAborted(signal);
+      if (!allowSecretRead && this._isSensitivePath(policyPath)) {
+        markSensitiveFileSkipped(state);
+        return;
+      }
       const relative = displayPath(this._root, absolute);
       if (include !== undefined && !matchesGlob(relative, path.basename(relative), include)) return;
       if (bytesScanned >= SEARCH_TOTAL_BYTES) {
@@ -1331,16 +1918,22 @@ class WorkspaceTools {
 
       try {
         const readLimit = Math.min(SEARCH_FILE_BYTES, SEARCH_TOTAL_BYTES - bytesScanned);
-        const result = await this._readUtf8(absolute, readLimit);
+        const result = await this._readUtf8(policyPath, readLimit, signal);
+        if (!allowSecretRead && isSensitiveContent(policyPath, result.text, signal)) {
+          this._rememberSensitivePath(policyPath);
+          markSensitiveFileSkipped(state);
+          return;
+        }
         bytesScanned += result.visibleBytes;
         filesScanned += 1;
         if (result.truncated) state.truncated = true;
 
-        const lines = splitTextLines(result.text);
-        const starts = lineStartIndexes(result.text);
+        const lines = splitTextLines(result.text, signal);
+        const starts = lineStartIndexes(result.text, signal);
         expression.lastIndex = 0;
         for (const match of result.text.matchAll(expression)) {
-          const lineNumber = lineNumberForOffset(starts, match.index);
+          throwIfAborted(signal);
+          const lineNumber = lineNumberForOffset(starts, match.index, signal);
           matches.push({
             path: relative,
             line: lineNumber,
@@ -1353,7 +1946,11 @@ class WorkspaceTools {
           }
         }
       } catch (error) {
-        if (isSensitiveFile(absolute)) return;
+        if (isAbortError(error)) throw error;
+        if (!allowSecretRead && this._isSensitivePath(policyPath)) {
+          markSensitiveFileSkipped(state);
+          return;
+        }
         if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'EBINARY'].includes(error.code)) {
           unreadableFiles += 1;
           return;
@@ -1369,15 +1966,17 @@ class WorkspaceTools {
         maxFiles: 5000,
         maxDirectories: 10_000,
         followSymlinkFiles: true,
-        skipSensitive: true,
+        skipSensitive: !allowSecretRead,
+        signal,
       }, state)) {
-        await searchFile(item.absolute);
+        await searchFile(item.absolute, item.resolved || item.absolute);
         if (stopped) break;
       }
     } else {
       throw new Error('Search path must be a file or directory.');
     }
 
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `Found ${matches.length} matches in ${filesScanned} files`,
@@ -1387,14 +1986,20 @@ class WorkspaceTools {
         bytesScanned,
         unreadableFiles,
         truncated: state.truncated || matches.length >= maxResults,
+        ...(state.sensitiveFilesSkipped > 0
+          ? { sensitiveFilesSkipped: state.sensitiveFilesSkipped, blocked: true, redacted: true }
+          : {}),
       },
     };
   }
 
-  async _getFileInfo(args) {
+  async _getFileInfo(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const target = this.resolveWorkspacePath(requestedPath);
     const stats = await fsp.stat(target);
+    throwIfAborted(signal);
     const extension = path.extname(target);
     return {
       ok: true,
@@ -1411,7 +2016,9 @@ class WorkspaceTools {
     };
   }
 
-  async _writeFile(args) {
+  async _writeFile(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const content = optionalString(args, 'content', { allowEmpty: true, required: true });
     const overwrite = optionalBoolean(args, 'overwrite', false);
@@ -1423,20 +2030,39 @@ class WorkspaceTools {
     let existed = false;
     try {
       const existing = await fsp.lstat(target);
+      throwIfAborted(signal);
       existed = true;
       if (existing.isDirectory()) throw new Error(`Destination is a directory: ${displayPath(this._root, target)}`);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       if (error.code !== 'ENOENT') throw error;
     }
     if (existed && !overwrite) throw new Error(`File already exists: ${displayPath(this._root, target)}`);
 
+    // The parent may not exist yet, so do a lexical/canonical containment
+    // revalidation first and a full parent check after creating it.
+    this._revalidatePathPair(target, parent, signal, 'Write destination');
+    throwIfAborted(signal);
     await fsp.mkdir(parent, { recursive: true });
+    throwIfAborted(signal);
+    const revalidated = await this._revalidateMutationPath(target, parent, signal, 'Write destination', {
+      allowMissing: true,
+    });
+    if (revalidated.targetStats) {
+      if (revalidated.targetStats.isDirectory()) {
+        throw new Error(`Destination is a directory: ${displayPath(this._root, target)}`);
+      }
+      if (!overwrite) throw new Error(`File already exists: ${displayPath(this._root, target)}`);
+    }
+    throwIfAborted(signal);
     try {
-      await fsp.writeFile(target, content, { encoding: 'utf8', flag: overwrite ? 'w' : 'wx' });
+      await fsp.writeFile(revalidated.target, content, { encoding: 'utf8', flag: overwrite ? 'w' : 'wx' });
     } catch (error) {
+      if (isAbortError(error)) throw error;
       if (error.code === 'EEXIST') throw new Error(`File already exists: ${displayPath(this._root, target)}`);
       throw error;
     }
+    throwIfAborted(signal);
 
     return {
       ok: true,
@@ -1449,18 +2075,23 @@ class WorkspaceTools {
     };
   }
 
-  async _editFile(args) {
+  async _editFile(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const oldText = optionalString(args, 'oldText', { allowEmpty: false });
     const newText = optionalString(args, 'newText', { allowEmpty: true, required: true });
     const replaceAll = optionalBoolean(args, 'replaceAll', false);
     const target = this.resolveWorkspacePath(requestedPath);
-    const result = await this._readUtf8(target, MAX_WRITE_BYTES);
+    const parent = this.resolveWorkspacePath(path.dirname(target));
+    const verifiedTarget = this._revalidateCanonicalPath(target, signal, 'Edit target');
+    const result = await this._readUtf8(verifiedTarget, MAX_WRITE_BYTES, signal);
     if (result.truncated) throw new Error('File is too large to edit (maximum 10 MiB).');
 
     let count = 0;
     let offset = 0;
     while (true) {
+      throwIfAborted(signal);
       const found = result.text.indexOf(oldText, offset);
       if (found === -1) break;
       count += 1;
@@ -1476,37 +2107,51 @@ class WorkspaceTools {
       : result.text.replace(oldText, () => newText);
     const byteLength = Buffer.byteLength(updated, 'utf8');
     if (byteLength > MAX_WRITE_BYTES) throw new RangeError('Edited file would exceed the 10 MiB limit.');
-    await fsp.writeFile(target, updated, 'utf8');
+    await this._revalidateMutationPath(verifiedTarget, parent, signal, 'Edit destination');
+    throwIfAborted(signal);
+    await fsp.writeFile(verifiedTarget, updated, 'utf8');
+    throwIfAborted(signal);
 
     return {
       ok: true,
-      summary: `Replaced ${count} occurrence${count === 1 ? '' : 's'} in ${displayPath(this._root, target)}`,
+      summary: `Replaced ${count} occurrence${count === 1 ? '' : 's'} in ${displayPath(this._root, verifiedTarget)}`,
       data: {
-        path: displayPath(this._root, target),
+        path: displayPath(this._root, verifiedTarget),
         replacements: count,
         bytesWritten: byteLength,
       },
     };
   }
 
-  async _applyPatch(args) {
+  async _applyPatch(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const patch = optionalString(args, 'patch', { allowEmpty: false });
     const target = this.resolveWorkspacePath(requestedPath);
-    const result = await this._readUtf8(target, MAX_WRITE_BYTES);
+    const parent = this.resolveWorkspacePath(path.dirname(target));
+    const verifiedTarget = this._revalidateCanonicalPath(target, signal, 'Patch target');
+    const result = await this._readUtf8(verifiedTarget, MAX_WRITE_BYTES, signal);
     if (result.truncated) throw new Error('File is too large to patch (maximum 10 MiB).');
 
-    const hunks = parseUnifiedDiff(patch, requestedPath);
-    const patched = applyParsedHunks(result.text, hunks);
+    const hunks = parseUnifiedDiff(patch, requestedPath, signal);
+    const patched = applyParsedHunks(result.text, hunks, signal);
     const byteLength = Buffer.byteLength(patched.content, 'utf8');
     if (byteLength > MAX_WRITE_BYTES) throw new RangeError('Patched file would exceed the 10 MiB limit.');
-    if (patched.content !== result.text) await fsp.writeFile(target, patched.content, 'utf8');
+    if (patched.content !== result.text) {
+      await this._revalidateMutationPath(verifiedTarget, parent, signal, 'Patch destination');
+      throwIfAborted(signal);
+      await fsp.writeFile(verifiedTarget, patched.content, 'utf8');
+      throwIfAborted(signal);
+    } else {
+      throwIfAborted(signal);
+    }
 
     return {
       ok: true,
-      summary: `Applied ${hunks.length} hunk${hunks.length === 1 ? '' : 's'} to ${displayPath(this._root, target)}`,
+      summary: `Applied ${hunks.length} hunk${hunks.length === 1 ? '' : 's'} to ${displayPath(this._root, verifiedTarget)}`,
       data: {
-        path: displayPath(this._root, target),
+        path: displayPath(this._root, verifiedTarget),
         hunksApplied: hunks.length,
         relocatedHunks: patched.relocatedHunks,
         bytesWritten: byteLength,
@@ -1515,19 +2160,34 @@ class WorkspaceTools {
     };
   }
 
-  async _createDirectory(args) {
+  async _createDirectory(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const target = this.resolveWorkspacePath(requestedPath);
+    const parent = this.resolveWorkspacePath(path.dirname(target));
     let existed = false;
     try {
       const stats = await fsp.stat(target);
+      throwIfAborted(signal);
       existed = true;
       if (!stats.isDirectory()) throw new Error(`Path exists and is not a directory: ${displayPath(this._root, target)}`);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       if (error.code !== 'ENOENT') throw error;
     }
 
+    this._revalidatePathPair(target, parent, signal, 'Directory destination');
+    throwIfAborted(signal);
     await fsp.mkdir(target, { recursive: true });
+    throwIfAborted(signal);
+    const revalidated = await this._revalidateMutationPath(target, parent, signal, 'Directory destination', {
+      allowMissing: true,
+    });
+    if (revalidated.targetStats && !revalidated.targetStats.isDirectory()) {
+      throw new Error(`Path exists and is not a directory: ${displayPath(this._root, target)}`);
+    }
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `${existed ? 'Directory already exists' : 'Created directory'} ${displayPath(this._root, target)}`,
@@ -1535,43 +2195,91 @@ class WorkspaceTools {
     };
   }
 
-  async _moveFile(args) {
+  async _moveFile(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const fromInput = optionalString(args, 'from', { allowEmpty: false });
     const toInput = optionalString(args, 'to', { allowEmpty: false });
     const overwrite = optionalBoolean(args, 'overwrite', false);
     const source = this.resolveWorkspacePath(fromInput);
     const destination = this.resolveWorkspacePath(toInput);
+    const sourceSensitive = this._isSensitivePath(source);
 
     if (isSamePath(source, destination)) throw new Error('Source and destination are the same path.');
     if (isSamePath(source, this._root)) throw new Error('The workspace root cannot be moved.');
     if (isInside(source, destination) && source !== destination) {
       throw new Error('A directory cannot be moved inside itself.');
     }
+    const sourceParent = this.resolveWorkspacePath(path.dirname(source));
+    const destinationParent = this.resolveWorkspacePath(path.dirname(destination));
 
     const sourceStats = await fsp.stat(source);
-    const destinationParent = this.resolveWorkspacePath(path.dirname(destination));
+    throwIfAborted(signal);
     let destinationExists = false;
     try {
       const destinationStats = await fsp.lstat(destination);
+      throwIfAborted(signal);
       destinationExists = true;
       if (destinationStats.isDirectory()) {
         throw new Error('Destination is a directory; provide a full destination file or directory name.');
       }
     } catch (error) {
+      if (isAbortError(error)) throw error;
       if (error.code !== 'ENOENT') throw error;
     }
     if (destinationExists && !overwrite) {
       throw new Error(`Destination already exists: ${displayPath(this._root, destination)}`);
     }
 
+    // The destination parent can be created recursively, so validate its
+    // canonical containment before mkdir and validate the actual parent again
+    // immediately before rename.
+    this._revalidatePathPair(source, sourceParent, signal, 'Move source');
+    this._revalidatePathPair(destination, destinationParent, signal, 'Move destination');
+    throwIfAborted(signal);
     await fsp.mkdir(destinationParent, { recursive: true });
-    try {
-      await fsp.rename(source, destination);
-    } catch (error) {
-      if (!overwrite || !['EEXIST', 'EPERM'].includes(error.code)) throw error;
-      await fsp.unlink(destination);
-      await fsp.rename(source, destination);
+    throwIfAborted(signal);
+
+    let verifiedSource = await this._revalidateMutationPath(source, sourceParent, signal, 'Move source');
+    let verifiedDestination = await this._revalidateMutationPath(destination, destinationParent, signal, 'Move destination', {
+      allowMissing: true,
+    });
+    if (verifiedDestination.targetStats) {
+      if (verifiedDestination.targetStats.isDirectory()) {
+        throw new Error('Destination is a directory; provide a full destination file or directory name.');
+      }
+      if (!overwrite) {
+        throw new Error(`Destination already exists: ${displayPath(this._root, destination)}`);
+      }
     }
+    if (verifiedSource.targetStats?.isDirectory() && isInside(source, destination)) {
+      throw new Error('A directory cannot be moved inside itself.');
+    }
+    throwIfAborted(signal);
+    try {
+      await fsp.rename(verifiedSource.target, verifiedDestination.target);
+      if (sourceSensitive) this._rememberSensitivePath(verifiedDestination.target);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (!overwrite || !['EEXIST', 'EPERM'].includes(error.code)) throw error;
+
+      verifiedSource = await this._revalidateMutationPath(source, sourceParent, signal, 'Move source');
+      verifiedDestination = await this._revalidateMutationPath(destination, destinationParent, signal, 'Move destination');
+      if (!verifiedDestination.targetStats || verifiedDestination.targetStats.isDirectory()) {
+        throw new Error('Destination changed before it could be replaced.');
+      }
+      throwIfAborted(signal);
+      await fsp.unlink(verifiedDestination.target);
+      throwIfAborted(signal);
+      verifiedSource = await this._revalidateMutationPath(source, sourceParent, signal, 'Move source');
+      verifiedDestination = await this._revalidateMutationPath(destination, destinationParent, signal, 'Move destination', {
+        allowMissing: true,
+      });
+      throwIfAborted(signal);
+      await fsp.rename(verifiedSource.target, verifiedDestination.target);
+      if (sourceSensitive) this._rememberSensitivePath(verifiedDestination.target);
+    }
+    throwIfAborted(signal);
 
     return {
       ok: true,
@@ -1585,19 +2293,30 @@ class WorkspaceTools {
     };
   }
 
-  async _deletePath(args) {
+  async _deletePath(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { allowEmpty: false });
     const recursive = optionalBoolean(args, 'recursive', false);
     const target = this.resolveWorkspacePath(requestedPath);
     if (isSamePath(target, this._root)) throw new Error('Refusing to delete the workspace root.');
+    const parent = this.resolveWorkspacePath(path.dirname(target));
 
     const stats = await fsp.lstat(target);
+    throwIfAborted(signal);
     if (this._trashItem) {
-      await this._trashItem(target);
+      const revalidated = await this._revalidateMutationPath(target, parent, signal, 'Delete target');
+      if (isSamePath(revalidated.target, this._root)) throw new Error('Refusing to delete the workspace root.');
+      if (revalidated.targetStats.isDirectory() !== stats.isDirectory()) {
+        throw new Error('Delete target changed before commit.');
+      }
+      throwIfAborted(signal);
+      await this._trashItem(revalidated.target);
+      throwIfAborted(signal);
       return {
         ok: true,
-        summary: `Moved ${displayPath(this._root, target)} to trash`,
-        data: { path: displayPath(this._root, target), trashed: true, type: stats.isDirectory() ? 'directory' : 'file' },
+        summary: `Moved ${displayPath(this._root, revalidated.target)} to trash`,
+        data: { path: displayPath(this._root, revalidated.target), trashed: true, type: revalidated.targetStats.isDirectory() ? 'directory' : 'file' },
       };
     }
 
@@ -1606,6 +2325,7 @@ class WorkspaceTools {
       let hasEntries = false;
       try {
         for await (const _entry of handle) {
+          throwIfAborted(signal);
           hasEntries = true;
           break;
         }
@@ -1613,12 +2333,25 @@ class WorkspaceTools {
         await handle.close().catch(() => {});
       }
       if (hasEntries) throw new Error('Directory is not empty; set recursive to true.');
-      await fsp.rmdir(target);
+      const revalidated = await this._revalidateMutationPath(target, parent, signal, 'Delete target');
+      if (isSamePath(revalidated.target, this._root)) throw new Error('Refusing to delete the workspace root.');
+      if (!revalidated.targetStats?.isDirectory()) throw new Error('Delete target changed before commit.');
+      throwIfAborted(signal);
+      await fsp.rmdir(revalidated.target);
     } else if (stats.isDirectory()) {
-      await fsp.rm(target, { recursive: true, force: false });
+      const revalidated = await this._revalidateMutationPath(target, parent, signal, 'Delete target');
+      if (isSamePath(revalidated.target, this._root)) throw new Error('Refusing to delete the workspace root.');
+      if (!revalidated.targetStats?.isDirectory()) throw new Error('Delete target changed before commit.');
+      throwIfAborted(signal);
+      await fsp.rm(revalidated.target, { recursive: true, force: false });
     } else {
-      await fsp.unlink(target);
+      const revalidated = await this._revalidateMutationPath(target, parent, signal, 'Delete target');
+      if (isSamePath(revalidated.target, this._root)) throw new Error('Refusing to delete the workspace root.');
+      if (revalidated.targetStats?.isDirectory()) throw new Error('Delete target changed before commit.');
+      throwIfAborted(signal);
+      await fsp.unlink(revalidated.target);
     }
+    throwIfAborted(signal);
 
     return {
       ok: true,
@@ -1627,7 +2360,9 @@ class WorkspaceTools {
     };
   }
 
-  async _projectOverview(args) {
+  async _projectOverview(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const maxFiles = clampInteger(args.maxFiles, 500, 1, 2000);
     const languageCounts = new Map();
     const manifests = [];
@@ -1643,6 +2378,7 @@ class WorkspaceTools {
       fileCount: 0,
       directoryCount: 0,
       scannedEntries: 0,
+      sensitiveFilesSkipped: 0,
       truncated: false,
       stopped: false,
     };
@@ -1650,7 +2386,9 @@ class WorkspaceTools {
       maxFiles,
       maxDirectories: 10_000,
       followSymlinkFiles: false,
+      signal,
     }, state)) {
+      throwIfAborted(signal);
       const basename = path.basename(item.absolute).toLowerCase();
       const relative = displayPath(this._root, item.absolute);
       const extension = path.extname(basename);
@@ -1667,7 +2405,9 @@ class WorkspaceTools {
     let topLevelScanned = 0;
     const handle = await fsp.opendir(this._root);
     try {
+      throwIfAborted(signal);
       for await (const entry of handle) {
+        throwIfAborted(signal);
         topLevelScanned += 1;
         if (topLevelScanned > MAX_DIRECTORY_ENTRIES_SCANNED) {
           state.truncated = true;
@@ -1692,6 +2432,7 @@ class WorkspaceTools {
       .sort((left, right) => right.count - left.count || left.extension.localeCompare(right.extension))
       .slice(0, 15);
 
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `Scanned ${state.fileCount} project files`,
@@ -1708,37 +2449,51 @@ class WorkspaceTools {
     };
   }
 
-  async _findSymbols(args) {
-    const query = optionalString(args, 'query');
+  async _findSymbols(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
+    const query = optionalString(args, 'query', { maxLength: 200 });
     const requestedPath = optionalString(args, 'path', { fallback: '.' });
     const maxResults = clampInteger(args.maxResults, 100, 1, MAX_RESULTS);
     if (query !== undefined && query.length === 0) throw new TypeError('query must not be empty when provided.');
-    if (query && query.length > 200) throw new RangeError('query must be at most 200 characters.');
 
     const start = this.resolveWorkspacePath(requestedPath);
     if (isIgnoredLocation(this._root, start)) {
       throw new Error(`Ignored directory: ${displayPath(this._root, start)}`);
     }
     const startStats = await fsp.stat(start);
+    throwIfAborted(signal);
+    const allowSecretRead = allowsSecretRead(context);
     const symbols = [];
     let filesScanned = 0;
     let bytesScanned = 0;
     let truncated = false;
+    let sensitiveFilesSkipped = 0;
 
-    const scanFile = async (absolute) => {
-      if (isSensitiveFile(absolute)) return;
+    const scanFile = async (absolute, policyPath = absolute) => {
+      throwIfAborted(signal);
+      if (!allowSecretRead && this._isSensitivePath(policyPath)) {
+        sensitiveFilesSkipped += 1;
+        return;
+      }
       if (bytesScanned >= 10 * 1024 * 1024) {
         truncated = true;
         return;
       }
       try {
-        const result = await this._readUtf8(absolute, Math.min(SEARCH_FILE_BYTES, 10 * 1024 * 1024 - bytesScanned));
+        const result = await this._readUtf8(policyPath, Math.min(SEARCH_FILE_BYTES, 10 * 1024 * 1024 - bytesScanned), signal);
+        if (!allowSecretRead && isSensitiveContent(policyPath, result.text, signal)) {
+          this._rememberSensitivePath(policyPath);
+          sensitiveFilesSkipped += 1;
+          return;
+        }
         bytesScanned += result.visibleBytes;
         filesScanned += 1;
         if (result.truncated) truncated = true;
         const extension = path.extname(absolute).toLowerCase();
-        const found = extractSymbols(result.text, extension);
+        const found = extractSymbols(result.text, extension, signal);
         for (const symbol of found) {
+          throwIfAborted(signal);
           if (query && !symbol.name.toLowerCase().includes(query.toLowerCase())) continue;
           symbols.push({ path: displayPath(this._root, absolute), ...symbol });
           if (symbols.length >= maxResults) {
@@ -1747,6 +2502,11 @@ class WorkspaceTools {
           }
         }
       } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (!allowSecretRead && this._isSensitivePath(policyPath)) {
+          sensitiveFilesSkipped += 1;
+          return;
+        }
         if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'EBINARY'].includes(error.code)) return;
         throw error;
       }
@@ -1759,6 +2519,7 @@ class WorkspaceTools {
         fileCount: 0,
         directoryCount: 0,
         scannedEntries: 0,
+        sensitiveFilesSkipped: 0,
         truncated: false,
         stopped: false,
       };
@@ -1766,24 +2527,37 @@ class WorkspaceTools {
         maxFiles: 2000,
         maxDirectories: 10_000,
         followSymlinkFiles: true,
-        skipSensitive: true,
+        skipSensitive: !allowSecretRead,
+        signal,
       }, state)) {
-        await scanFile(item.absolute);
+        await scanFile(item.absolute, item.resolved || item.absolute);
         if (symbols.length >= maxResults) break;
       }
       truncated = truncated || state.truncated;
+      sensitiveFilesSkipped += state.sensitiveFilesSkipped;
     } else {
       throw new Error('Symbol search path must be a file or directory.');
     }
 
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `Found ${symbols.length} symbols in ${filesScanned} files`,
-      data: { symbols, filesScanned, bytesScanned, truncated },
+      data: {
+        symbols,
+        filesScanned,
+        bytesScanned,
+        truncated,
+        ...(sensitiveFilesSkipped > 0
+          ? { sensitiveFilesSkipped, blocked: true, redacted: true }
+          : {}),
+      },
     };
   }
 
-  async _projectMap(args) {
+  async _projectMap(args, context) {
+    const signal = getSignal(context);
+    throwIfAborted(signal);
     const requestedPath = optionalString(args, 'path', { fallback: '.' });
     const depth = clampInteger(args.depth, 2, 1, 6);
     const maxEntries = clampInteger(args.maxEntries, 150, 1, MAX_RESULTS);
@@ -1792,6 +2566,7 @@ class WorkspaceTools {
       throw new Error(`Ignored directory: ${displayPath(this._root, start)}`);
     }
     const startStats = await fsp.stat(start);
+    throwIfAborted(signal);
     const entries = [];
     let fileCount = 0;
     let directoryCount = 0;
@@ -1803,6 +2578,7 @@ class WorkspaceTools {
       fileCount = 1;
     } else if (startStats.isDirectory()) {
       const visit = async (directory, level) => {
+        throwIfAborted(signal);
         if (entries.length >= maxEntries) {
           truncated = true;
           return;
@@ -1811,12 +2587,14 @@ class WorkspaceTools {
         const collected = [];
         let scanned = 0;
         const handle = await fsp.opendir(directory).catch((error) => {
+          if (isAbortError(error)) throw error;
           inaccessibleDirectories += 1;
           return null;
         });
         if (!handle) return;
         try {
           for await (const entry of handle) {
+            throwIfAborted(signal);
             scanned += 1;
             if (scanned > MAX_DIRECTORY_ENTRIES_SCANNED) {
               truncated = true;
@@ -1829,6 +2607,7 @@ class WorkspaceTools {
         } finally {
           await handle.close().catch(() => {});
         }
+        throwIfAborted(signal);
         collected.sort((left, right) => {
           const leftDirectory = left.isDirectory() ? 0 : 1;
           const rightDirectory = right.isDirectory() ? 0 : 1;
@@ -1836,6 +2615,7 @@ class WorkspaceTools {
         });
 
         for (const entry of collected) {
+          throwIfAborted(signal);
           if (entries.length >= maxEntries) {
             truncated = true;
             break;
@@ -1846,7 +2626,9 @@ class WorkspaceTools {
           if (entry.isFile()) {
             try {
               item.size = (await fsp.lstat(absolute)).size;
-            } catch {
+              throwIfAborted(signal);
+            } catch (error) {
+              if (isAbortError(error)) throw error;
               item.size = null;
             }
             fileCount += 1;
@@ -1863,6 +2645,7 @@ class WorkspaceTools {
       throw new Error('Project map path must be a file or directory.');
     }
 
+    throwIfAborted(signal);
     return {
       ok: true,
       summary: `Mapped ${entries.length} entries`,
@@ -1879,21 +2662,32 @@ class WorkspaceTools {
   }
 
   async *_walkFiles(start, options, state) {
+    const signal = options.signal;
     const maxFiles = options.maxFiles ?? 5000;
     const maxDirectories = options.maxDirectories ?? 10_000;
     const followSymlinkFiles = options.followSymlinkFiles === true;
+    throwIfAborted(signal);
     const startStats = await fsp.stat(start);
+    throwIfAborted(signal);
 
     if (startStats.isFile()) {
-      if (isSensitiveFile(start) && options.skipSensitive) return;
+      if (options.skipSensitive && this._isSensitivePath(start)) {
+        markSensitiveFileSkipped(state);
+        return;
+      }
       state.fileCount += 1;
       yield { absolute: start, size: startStats.size, symlink: false };
       return;
     }
     if (!startStats.isDirectory()) return;
+    if (options.skipSensitive && this._isSensitivePath(start)) {
+      markSensitiveFileSkipped(state);
+      return;
+    }
 
     const stack = [start];
     while (stack.length > 0 && !state.stopped) {
+      throwIfAborted(signal);
       const directory = stack.pop();
       if (state.directoryCount >= maxDirectories) {
         state.truncated = true;
@@ -1901,10 +2695,14 @@ class WorkspaceTools {
       }
       state.directoryCount += 1;
 
-      const handle = await fsp.opendir(directory).catch(() => null);
+      const handle = await fsp.opendir(directory).catch((error) => {
+        if (isAbortError(error)) throw error;
+        return null;
+      });
       if (!handle) continue;
       try {
         for await (const entry of handle) {
+          throwIfAborted(signal);
           if (state.stopped) break;
           state.scannedEntries += 1;
           if (state.scannedEntries > MAX_DIRECTORY_ENTRIES_SCANNED) {
@@ -1915,23 +2713,35 @@ class WorkspaceTools {
           const absolute = path.join(directory, entry.name);
           if (IGNORED_DIRECTORY_NAMES.has(entry.name.toLowerCase())) continue;
           if (entry.isDirectory()) {
+            if (options.skipSensitive && this._isSensitivePath(absolute)) {
+              markSensitiveFileSkipped(state);
+              continue;
+            }
             stack.push(absolute);
             continue;
           }
           if (entry.isSymbolicLink()) {
             if (!followSymlinkFiles) continue;
             const resolved = this.resolveWorkspacePath(absolute);
+            throwIfAborted(signal);
             const linkedStats = await fsp.stat(resolved);
+            throwIfAborted(signal);
             if (!linkedStats.isFile()) continue;
-            if (options.skipSensitive && isSensitiveFile(resolved)) continue;
+            if (options.skipSensitive && this._isSensitivePath(resolved)) {
+              markSensitiveFileSkipped(state);
+              continue;
+            }
             if (state.fileCount >= maxFiles) {
               state.truncated = true;
               break;
             }
             state.fileCount += 1;
-            yield { absolute, size: linkedStats.size, symlink: true };
+            yield { absolute, resolved, size: linkedStats.size, symlink: true };
           } else if (entry.isFile()) {
-            if (options.skipSensitive && isSensitiveFile(absolute)) continue;
+            if (options.skipSensitive && this._isSensitivePath(absolute)) {
+              markSensitiveFileSkipped(state);
+              continue;
+            }
             if (state.fileCount >= maxFiles) {
               state.truncated = true;
               break;
@@ -1940,7 +2750,9 @@ class WorkspaceTools {
             let size;
             try {
               size = (await fsp.lstat(absolute)).size;
-            } catch {
+              throwIfAborted(signal);
+            } catch (error) {
+              if (isAbortError(error)) throw error;
               size = undefined;
             }
             yield { absolute, size, symlink: false };
@@ -1951,6 +2763,7 @@ class WorkspaceTools {
       }
     }
 
+    throwIfAborted(signal);
     if (stack.length > 0) state.truncated = true;
   }
 }

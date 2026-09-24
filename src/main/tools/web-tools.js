@@ -5,13 +5,12 @@
  *
  * The URL checks in this file are deliberately performed before every request,
  * including every redirect.  DNS answers are checked immediately before a
- * request as well.  The normal fetch transport cannot be given a portable
- * address-pinning hook on all Node versions, so a very small DNS-rebinding
- * race remains possible with that transport.  `nativeTransport: true` uses
- * node:http/node:https with a checked address supplied through `lookup`, which
- * provides the strongest protection available without a third-party HTTP
- * dispatcher.  Neither transport ever evaluates HTML, JavaScript, or page
- * content.
+ * request as well.  The normal, production transport is node:http/node:https
+ * with a checked address supplied through `lookup`, so the address used for
+ * the connection is the address that was checked.  A caller may explicitly
+ * inject a fetch implementation (primarily for deterministic tests), but that
+ * transport cannot provide the same portable address-pinning guarantee.
+ * Neither transport ever evaluates HTML, JavaScript, or page content.
  */
 
 const http = require('node:http');
@@ -52,8 +51,42 @@ const SENSITIVE_KEY_RE = /(?:authorization|proxy[-_]?authorization|cookie|set[-_
 const SENSITIVE_QUERY_RE = /([?&](?:access[-_]?token|refresh[-_]?token|id[-_]?token|token|api[-_]?key|apikey|key|secret|password|passwd|auth|authorization|signature|sig)=)[^&#\s]*/gi;
 const SENSITIVE_ASSIGNMENT_RE = /(?<![A-Za-z])((?:["']?)(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|x[-_]?api[-_]?key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|token|secret|password|passwd|credential|private[-_]?key|client[-_]?secret|(?:[A-Za-z0-9]+[-_])*api[-_]?key|(?:^|[-_])key(?:$|[-_])|key)(?:["']?)\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,;\]}\[]+))/gi;
 
+// These fields either describe a single hop or let a caller interfere with
+// Node's framing/routing.  They are rejected rather than silently forwarded:
+// forwarding them can enable request smuggling, connection reuse surprises,
+// or a host-header override.
+const UNSAFE_REQUEST_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'expect',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+const SENSITIVE_HEADER_RE = /(?:^|[-_])(?:authorization|authentication|proxy[-_]?authorization|cookie2?|set[-_]?cookie|apikey|api[-_]?key|access[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth(?:orization)?|bearer[-_]?token|client[-_]?secret|private[-_]?key|token|secret|password|passwd|credential|signature|sig|session|csrf|xsrf|key)(?:$|[-_])/i;
+
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isSensitiveHeaderName(name) {
+  const normalized = String(name || '').replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase().replace(/[_.]+/g, '-');
+  return SENSITIVE_HEADER_RE.test(normalized);
+}
+
+function stripSensitiveHeaders(headers) {
+  const result = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    const text = String(value ?? '');
+    if (!isSensitiveHeaderName(name) && redactString(text) === text) result[name] = value;
+  }
+  return result;
 }
 
 function clampInteger(value, fallback, minimum, maximum) {
@@ -421,6 +454,7 @@ function validateUrl(rawUrl, options = {}) {
   if (!hostname || BLOCKED_HOSTNAMES.has(hostname) || hostname.endsWith('.localhost') || hostname.endsWith('.localhost.localdomain')) {
     throw new Error('Localhost and metadata hostnames are not allowed');
   }
+  if (net.isIP(hostname) && isPrivateAddress(hostname)) throw new Error('Private or reserved IP addresses are not allowed');
   if (url.port) {
     const port = Number(url.port);
     const standard = STANDARD_PORTS[url.protocol];
@@ -475,9 +509,15 @@ class WebTools {
       ? [...new Set(opts.allowedPorts.map(Number).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))]
       : [];
     this.lookup = opts.lookup || opts.dnsLookup || opts.resolve || dns.promises.lookup.bind(dns.promises);
-    this.nativeTransport = opts.nativeTransport === true;
     const suppliedFetch = opts.fetchImpl || opts.fetch;
     this.fetchImpl = suppliedFetch || null;
+    // Native http/https is the safe production default.  An explicitly
+    // supplied fetch implementation remains a supported, deterministic
+    // injection point for callers and tests; callers can still force either
+    // transport with nativeTransport.
+    this.nativeTransport = opts.nativeTransport === undefined
+      ? !suppliedFetch
+      : opts.nativeTransport === true;
     this.userAgent = USER_AGENT;
   }
 
@@ -594,13 +634,18 @@ class WebTools {
   _headers(input = {}) {
     if (!isObject(input)) throw new Error('headers must be an object');
     const result = {};
+    const names = new Set();
     let count = 0;
     for (const [name, value] of Object.entries(input)) {
-      if (++count > 100 || ['__proto__', 'prototype', 'constructor'].includes(name) || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(name)) throw new Error('headers contain an invalid name');
+      const normalizedName = String(name).toLowerCase();
+      if (++count > 100 || name.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(name) || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(name)) throw new Error('headers contain an invalid name');
+      if (UNSAFE_REQUEST_HEADERS.has(normalizedName)) throw new Error(`header ${name} is not allowed`);
+      if (names.has(normalizedName)) throw new Error('headers contain a duplicate name');
+      names.add(normalizedName);
       if (typeof value !== 'string' || value.length > 16_384 || /[\r\n]/.test(value)) throw new Error('headers contain an invalid value');
       result[name] = value;
     }
-    if (!Object.keys(result).some((name) => name.toLowerCase() === 'user-agent')) result['User-Agent'] = this.userAgent;
+    if (!names.has('user-agent')) result['User-Agent'] = this.userAgent;
     return result;
   }
 
@@ -710,8 +755,10 @@ class WebTools {
           } catch {
             throw new Error('Redirect URL is invalid');
           }
+          const previousOrigin = current.origin;
           current = validateUrl(next.toString(), { allowedPorts });
           redirects += 1;
+          if (current.origin !== previousOrigin) headers = stripSensitiveHeaders(headers);
           if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
             method = 'GET';
             body = undefined;
@@ -746,6 +793,12 @@ class WebTools {
         redirect: 'manual',
         signal: controller.signal,
       });
+      if (response && response.redirected) throw new Error('Redirects must be handled explicitly');
+      if (response && response.url) {
+        let responseUrl;
+        try { responseUrl = new URL(response.url, url); } catch { throw new Error('Response URL is invalid'); }
+        if (responseUrl.origin !== url.origin) throw new Error('Cross-origin redirects are not allowed');
+      }
       const bodyPromise = this._readFetchBody(response, this.maxBytes, options.method);
       const body = await new Promise((resolve, reject) => {
         let settled = false;
@@ -852,6 +905,7 @@ class WebTools {
       const transport = url.protocol === 'https:' ? https : http;
       const hostname = url.hostname.replace(/^\[|\]$/g, '');
       const addresses = Array.isArray(options.addresses) && options.addresses.length ? options.addresses : [{ address: hostname, family: net.isIP(hostname) }];
+      if (!addresses.length || addresses.some((item) => !item || isBlockedAddress(item.address))) throw new Error('URL resolves to a private or reserved address');
       const headers = this._headers(options.headers);
       const externalSignal = context && context.signal;
       let settled = false;
@@ -936,9 +990,14 @@ class WebTools {
           response.on('aborted', () => finish(new Error('Response was aborted')));
           response.on('error', (error) => finish(error));
         });
-        request.setTimeout(this.requestTimeout, () => {
-          request.destroy(new Error('Request timed out'));
-        });
+        const timeoutRequest = () => {
+          const error = new Error('Request timed out');
+          error.code = 'ETIMEDOUT';
+          try { if (request) request.destroy(error); } catch { /* best effort timeout */ }
+          finish(error);
+        };
+        timer = setTimeout(timeoutRequest, this.requestTimeout);
+        request.setTimeout(this.requestTimeout, timeoutRequest);
         request.on('error', (error) => finish(error));
         if (options.body !== undefined && options.method !== 'GET' && options.method !== 'HEAD') request.write(options.body);
         request.end();
@@ -1094,7 +1153,7 @@ module.exports = {
   USER_AGENT,
   DEFAULT_MAX_BYTES,
   MAX_REDIRECTS,
-  SECURITY_LIMITS: 'URLs and DNS answers are revalidated before every request and redirect. The fetch transport has a portable DNS-rebinding TOCTOU limitation; use nativeTransport for checked address pinning through node:http/node:https.',
+  SECURITY_LIMITS: 'URLs and DNS answers are revalidated before every request and redirect. Native address-pinned transport is the default; an explicitly injected fetch transport is supported for deterministic callers but cannot provide the same DNS-pinning guarantee.',
   htmlToText,
   isPrivateAddress,
   isPrivateIP: isPrivateAddress,

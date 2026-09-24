@@ -13,6 +13,9 @@ const { EventEmitter } = require('node:events');
 const { spawn: nodeSpawn } = require('node:child_process');
 const { TextDecoder } = require('node:util');
 const { createHash } = require('node:crypto');
+const dns = require('node:dns');
+const net = require('node:net');
+const { isPrivateAddress } = require('../tools/web-tools');
 
 const MCP_PROTOCOL_VERSION = '2025-06-18';
 const CLIENT_NAME = 'CoderLocally';
@@ -27,6 +30,64 @@ const MAX_SCHEMA_DEPTH = 8;
 const MAX_SCHEMA_PROPERTIES = 128;
 const MAX_EXPOSED_NAME = 64;
 const MAX_INTERNAL_TOOL_NAME = 128;
+const DEFAULT_STARTUP_TIMEOUT = 60_000;
+const MAX_CONFIG_URL_CHARS = 8_192;
+const MAX_COMMAND_CHARS = 4_096;
+const MAX_ARGS = 256;
+const MAX_ARG_CHARS = 16_384;
+const MAX_CWD_CHARS = 4_096;
+const MAX_HEADER_ENTRIES = 100;
+const MAX_HEADER_VALUE_CHARS = 16_384;
+const MAX_ENV_ENTRIES = 200;
+const MAX_ENV_VALUE_CHARS = 16_384;
+const MAX_CONFIG_TEXT_BYTES = 256_000;
+
+const HTTP_HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'expect',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+const BLOCKED_MCP_HOSTNAMES = new Set([
+  'localhost',
+  'localhost.localdomain',
+  'ip6-localhost',
+  'ip6-loopback',
+  'metadata',
+  'metadata.google.internal',
+  'metadata.goog',
+  'metadata.azure.com',
+  'instance-data',
+  'instance-data.ec2.internal',
+]);
+
+const STDIO_ENV_PASSTHROUGH = new Set([
+  'path',
+  'systemroot',
+  'windir',
+  'comspec',
+  'pathext',
+  'temp',
+  'tmp',
+  'tmpdir',
+  'home',
+  'user',
+  'logname',
+  'shell',
+  'lang',
+  'lc_all',
+  'lc_ctype',
+  'systemdrive',
+]);
 
 const SENSITIVE_KEY_RE = /(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|x[-_]?api[-_]?key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|token|secret|password|passwd|credential|private[-_]?key|client[-_]?secret|(?:[A-Za-z0-9]+[-_])*api[-_]?key|(?:^|[-_])key(?:$|[-_])|(?<![A-Za-z])key(?![A-Za-z]))/i;
 const SENSITIVE_QUERY_RE = /([?&](?:access[-_]?token|refresh[-_]?token|id[-_]?token|token|api[-_]?key|apikey|key|secret|password|passwd|auth|authorization|signature|sig)=)[^&#\s]*/gi;
@@ -41,6 +102,121 @@ function clampInteger(value, fallback, minimum, maximum) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.max(minimum, Math.min(maximum, Math.floor(number)));
+}
+
+function normalizedHostname(value) {
+  return String(value || '').trim().replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+}
+
+function isBlockedMcpHostname(value) {
+  const hostname = normalizedHostname(value);
+  return BLOCKED_MCP_HOSTNAMES.has(hostname)
+    || hostname.endsWith('.localhost')
+    || hostname.endsWith('.localhost.localdomain');
+}
+
+function isBlockedMcpAddress(value) {
+  const kind = net.isIP(normalizedHostname(value));
+  return kind === 0 || isPrivateAddress(value);
+}
+
+function lookupAllAddresses(lookup, hostname, context = {}, timeout = DEFAULT_REQUEST_TIMEOUT) {
+  if (context && context.signal && context.signal.aborted) return Promise.reject(new Error('Request cancelled'));
+  const host = normalizedHostname(hostname);
+  const direct = net.isIP(host);
+  if (direct) return Promise.resolve([{ address: host, family: direct }]);
+  if (typeof lookup !== 'function') return Promise.reject(new Error('DNS resolver is unavailable'));
+
+  const lookupPromise = new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(value);
+    };
+    let returned;
+    try {
+      returned = lookup(host, { all: true, verbatim: true }, (error, addresses) => {
+        if (error) finish(error);
+        else finish(null, addresses);
+      });
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    if (returned && typeof returned.then === 'function') {
+      returned.then((value) => finish(null, value), (error) => finish(error));
+    } else if (returned !== undefined) {
+      finish(null, returned);
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const signal = context && context.signal;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', onAbort);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onAbort = () => finish(new Error('Request cancelled'));
+    if (signal) {
+      if (signal.aborted) {
+        finish(new Error('Request cancelled'));
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    timer = setTimeout(() => finish(new Error('DNS lookup timed out')), Math.max(1, Number(timeout) || DEFAULT_REQUEST_TIMEOUT));
+    lookupPromise.then((value) => finish(null, value), (error) => finish(error));
+  }).then((result) => {
+    const values = typeof result === 'string'
+      ? [result]
+      : Array.isArray(result)
+        ? result
+        : result && typeof result === 'object' && result.address
+          ? [result]
+          : [];
+    const addresses = values
+      .map((item) => typeof item === 'string' ? { address: item, family: net.isIP(item) } : item)
+      .filter((item) => item && typeof item.address === 'string' && net.isIP(item.address))
+      .map((item) => ({ address: item.address, family: Number(item.family) || net.isIP(item.address) }));
+    if (!addresses.length) throw new Error('DNS returned no usable address');
+    return addresses;
+  });
+}
+
+function buildStdioEnv(configured = {}, inherited = process.env) {
+  const output = {};
+  const keys = new Set();
+  const addInherited = (name, value) => {
+    const normalized = String(name).toLowerCase();
+    if (!STDIO_ENV_PASSTHROUGH.has(normalized) || keys.has(normalized) || typeof value !== 'string') return;
+    output[name] = value;
+    keys.add(normalized);
+  };
+
+  // Do not copy arbitrary process.env values (API keys, cloud credentials,
+  // proxy passwords, and so on) into an untrusted MCP process.
+  for (const [name, value] of Object.entries(inherited || {})) addInherited(name, value);
+  for (const [name, value] of Object.entries(configured || {})) {
+    const normalized = String(name).toLowerCase();
+    for (const existing of Object.keys(output)) {
+      if (existing.toLowerCase() === normalized) delete output[existing];
+    }
+    output[name] = value;
+    keys.add(normalized);
+  }
+  return output;
+}
+
+function configTextSize(config) {
+  try { return Buffer.byteLength(JSON.stringify(config), 'utf8'); } catch { return Number.MAX_SAFE_INTEGER; }
 }
 
 function redactString(value) {
@@ -80,6 +256,29 @@ function redact(value, seen = new WeakSet()) {
       configurable: true,
       writable: true,
     });
+  }
+  return output;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function scrubConfiguredValue(text, secret) {
+  if (typeof secret !== 'string' || !secret) return text;
+  const candidates = [secret];
+  try {
+    const encoded = encodeURIComponent(secret);
+    if (encoded && encoded !== secret) candidates.push(encoded);
+  } catch { /* malformed surrogate pair; raw value is still scrubbed */ }
+  let output = String(text);
+  for (const candidate of candidates) {
+    if (candidate.length >= 3) {
+      output = output.split(candidate).join('[REDACTED]');
+    } else {
+      const expression = new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(candidate)}(?=$|[^A-Za-z0-9])`, 'g');
+      output = output.replace(expression, '$1[REDACTED]');
+    }
   }
   return output;
 }
@@ -275,10 +474,15 @@ function validateHeaders(headers) {
   if (headers === undefined) return {};
   if (!isObject(headers)) throw new TypeError('HTTP headers must be an object');
   const output = {};
+  const names = new Set();
   let count = 0;
   for (const [name, value] of Object.entries(headers)) {
-    if (++count > 100 || ['__proto__', 'prototype', 'constructor'].includes(name) || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(name)) throw new TypeError('HTTP headers contain an invalid name');
-    if (typeof value !== 'string' || value.length > 16_384 || /[\r\n]/.test(value)) throw new TypeError('HTTP headers contain an invalid value');
+    const normalizedName = String(name).toLowerCase();
+    if (++count > MAX_HEADER_ENTRIES || name.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(name) || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(name)) throw new TypeError('HTTP headers contain an invalid name');
+    if (HTTP_HOP_BY_HOP_HEADERS.has(normalizedName)) throw new TypeError(`HTTP header ${name} is not allowed`);
+    if (names.has(normalizedName)) throw new TypeError('HTTP headers contain a duplicate name');
+    names.add(normalizedName);
+    if (typeof value !== 'string' || value.length > MAX_HEADER_VALUE_CHARS || /[\r\n]/.test(value)) throw new TypeError('HTTP headers contain an invalid value');
     output[name] = value;
   }
   return output;
@@ -288,40 +492,72 @@ function validateEnv(env) {
   if (env === undefined) return {};
   if (!isObject(env)) throw new TypeError('stdio env must be an object');
   const output = {};
+  const names = new Set();
   let count = 0;
   for (const [name, value] of Object.entries(env)) {
-    if (++count > 200 || ['__proto__', 'prototype', 'constructor'].includes(name) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof value !== 'string') throw new TypeError('stdio env contains an invalid entry');
-    if (/[\r\n]/.test(value) || value.length > 16_384) throw new TypeError('stdio env contains an invalid value');
+    const normalizedName = String(name).toLowerCase();
+    if (++count > MAX_ENV_ENTRIES || name.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(name) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof value !== 'string') throw new TypeError('stdio env contains an invalid entry');
+    if (names.has(normalizedName)) throw new TypeError('stdio env contains a duplicate name');
+    names.add(normalizedName);
+    if (/[\r\n]/.test(value) || value.length > MAX_ENV_VALUE_CHARS) throw new TypeError('stdio env contains an invalid value');
     output[name] = value;
   }
   return output;
 }
 
-function normalizeConfig(config) {
+function normalizeConfig(config, options = {}) {
   if (!isObject(config)) throw new TypeError('MCP config must be an object');
-  const declared = String(config.type || config.transport || '').toLowerCase();
-  const isStdio = declared === 'stdio' || (!declared && typeof config.command === 'string');
-  const isHttp = declared === 'http' || declared === 'streamable-http' || declared === 'streamable_http' || declared === 'streamablehttp' || (!declared && typeof config.url === 'string');
+  if (configTextSize(config) > MAX_CONFIG_TEXT_BYTES) throw new TypeError('MCP config is too large');
+  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(config, key);
+  const declared = String((hasOwn('type') ? config.type : undefined) || (hasOwn('transport') ? config.transport : undefined) || '').toLowerCase();
+  if (declared.length > 64) throw new TypeError('MCP transport is invalid');
+  const command = hasOwn('command') ? config.command : undefined;
+  const urlValue = hasOwn('url') ? config.url : undefined;
+  const isStdio = declared === 'stdio' || (!declared && typeof command === 'string');
+  const isHttp = declared === 'http' || declared === 'streamable-http' || declared === 'streamable_http' || declared === 'streamablehttp' || (!declared && typeof urlValue === 'string');
   if (declared === 'sse' || declared === 'http+sse' || declared === 'http-sse') {
     throw new TypeError('Legacy HTTP+SSE transport is not supported; configure streamable HTTP');
   }
-  if (isStdio && typeof config.command === 'string' && config.command.trim()) {
-    if (config.args !== undefined && (!Array.isArray(config.args) || config.args.some((item) => typeof item !== 'string'))) throw new TypeError('stdio args must be an array of strings');
-    if (config.cwd !== undefined && (typeof config.cwd !== 'string' || config.cwd.length > 4096 || /[\r\n]/.test(config.cwd))) throw new TypeError('stdio cwd is invalid');
+  const hasAllowPrivateNetwork = Object.prototype.hasOwnProperty.call(config, 'allowPrivateNetwork');
+  if (hasAllowPrivateNetwork && typeof config.allowPrivateNetwork !== 'boolean') {
+    throw new TypeError('MCP allowPrivateNetwork must be a boolean');
+  }
+  if (isStdio && typeof command === 'string' && command.trim()) {
+    if (command.length > MAX_COMMAND_CHARS || /[\r\n\0]/.test(command)) throw new TypeError('stdio command is invalid');
+    const args = hasOwn('args') ? config.args : undefined;
+    const cwd = hasOwn('cwd') ? config.cwd : undefined;
+    const env = hasOwn('env') ? config.env : undefined;
+    if (args !== undefined && (!Array.isArray(args) || args.length > MAX_ARGS || args.some((item) => typeof item !== 'string' || item.length > MAX_ARG_CHARS || /[\r\n\0]/.test(item)))) throw new TypeError('stdio args must be a bounded array of strings');
+    if (cwd !== undefined && (typeof cwd !== 'string' || cwd.length > MAX_CWD_CHARS || /[\r\n\0]/.test(cwd))) throw new TypeError('stdio cwd is invalid');
+    if (hasAllowPrivateNetwork && config.allowPrivateNetwork === true) throw new TypeError('allowPrivateNetwork is only valid for HTTP MCP servers');
     return {
       kind: 'stdio',
-      command: config.command,
-      args: config.args ? config.args.slice() : [],
-      env: validateEnv(config.env),
-      ...(config.cwd ? { cwd: config.cwd } : {}),
+      command,
+      args: args ? args.slice() : [],
+      env: validateEnv(env),
+      ...(cwd ? { cwd } : {}),
     };
   }
-  if (isHttp && typeof config.url === 'string') {
+  if (isHttp && typeof urlValue === 'string') {
+    if (!urlValue.trim() || urlValue.length > MAX_CONFIG_URL_CHARS) throw new TypeError('MCP HTTP URL is invalid');
     let url;
-    try { url = new URL(config.url); } catch { throw new TypeError('MCP HTTP URL is invalid'); }
+    try { url = new URL(urlValue); } catch { throw new TypeError('MCP HTTP URL is invalid'); }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError('MCP HTTP URL must use http or https');
     if (url.username || url.password) throw new TypeError('MCP HTTP URL credentials are not allowed');
-    return { kind: 'http', url: url.toString(), headers: validateHeaders(config.headers) };
+    if (url.toString().length > MAX_CONFIG_URL_CHARS) throw new TypeError('MCP HTTP URL is too long');
+    // This is deliberately an explicit boolean opt-in; hostnames are never
+    // treated as trusted merely because they look local or are renderer-supplied.
+    const allowPrivateNetwork = (hasAllowPrivateNetwork && config.allowPrivateNetwork === true) || options.allowPrivateNetwork === true;
+    const hostname = normalizedHostname(url.hostname);
+    if (!allowPrivateNetwork && (isBlockedMcpHostname(hostname) || (net.isIP(hostname) && isPrivateAddress(hostname)))) {
+      throw new TypeError('MCP private-network access requires allowPrivateNetwork:true');
+    }
+    return {
+      kind: 'http',
+      url: url.toString(),
+      headers: validateHeaders(hasOwn('headers') ? config.headers : undefined),
+      allowPrivateNetwork,
+    };
   }
   throw new TypeError('MCP config must define stdio command or streamable HTTP url');
 }
@@ -410,14 +646,20 @@ class McpManager extends EventEmitter {
     super();
     const opts = isObject(options) ? options : {};
     this.requestTimeout = clampInteger(opts.requestTimeout, DEFAULT_REQUEST_TIMEOUT, 1, 300_000);
+    this.startupTimeout = clampInteger(opts.startupTimeout, Math.min(DEFAULT_STARTUP_TIMEOUT, Math.max(10, this.requestTimeout * 3)), 10, 600_000);
     this.fetchImpl = opts.fetchImpl || opts.fetch || null;
+    this.lookup = opts.lookup || opts.dnsLookup || opts.resolve || dns.promises.lookup.bind(dns.promises);
+    this.allowPrivateNetwork = opts.allowPrivateNetwork === true;
     this.spawnImpl = opts.spawnImpl || opts.spawn || nodeSpawn;
     this.maxResponseBytes = clampInteger(opts.maxResponseBytes, MAX_RESPONSE_BYTES, 1, 20_000_000);
     this.maxToolResultChars = clampInteger(opts.maxToolResultChars, 100_000, 1, 2_000_000);
     this.configs = new Map();
     this.servers = new Map();
     this.serverSegments = new Map();
+    this.serverGenerations = new Map();
     this.toolIndex = new Map();
+    this.lifecycleTail = Promise.resolve();
+    this.lifecycleEpoch = 0;
     this.started = false;
     this.protocolVersion = MCP_PROTOCOL_VERSION;
     this.clientInfo = { name: CLIENT_NAME, version: CLIENT_VERSION };
@@ -436,15 +678,15 @@ class McpManager extends EventEmitter {
         initialized: Boolean(server.initialized),
         stderrBytes: Buffer.byteLength(server.stderrRing || ''),
       };
-      if (server.error) item.error = redactString(server.error).slice(0, 1_000);
-      const displayName = redactString(name).slice(0, 160) || 'server';
+      if (server.error) item.error = this._scrubConfiguredSecrets(redactString(server.error)).slice(0, 1_000);
+      const displayName = this._scrubConfiguredSecrets(redactString(name)).slice(0, 160) || 'server';
       servers[displayName] = item;
       if (server.status === 'starting') anyStarting = true;
       if (server.status === 'error') anyError = true;
       if (server.status === 'stopped') anyStopped = true;
     }
     for (const name of this.configs.keys()) {
-      const displayName = redactString(name).slice(0, 160) || 'server';
+      const displayName = this._scrubConfiguredSecrets(redactString(name)).slice(0, 160) || 'server';
       if (servers[displayName]) continue;
       servers[displayName] = { status: 'stopped', running: false, toolCount: 0, initialized: false, stderrBytes: 0 };
       anyStopped = true;
@@ -453,15 +695,38 @@ class McpManager extends EventEmitter {
     return { status: state, running: this.started, started: this.started, servers };
   }
 
+  _enqueueLifecycle(task) {
+    const operation = this.lifecycleTail.then(() => task(), () => task());
+    // Lifecycle operations are intentionally serialized.  Always attach a
+    // handler to the queued promise so a fire-and-forget addConfig/reload
+    // cannot create an unhandled rejection in the main process.
+    const safeOperation = operation.catch((error) => {
+      this._emitError(error);
+    });
+    this.lifecycleTail = safeOperation;
+    return safeOperation;
+  }
+
   addConfig(name, config) {
     if (typeof name !== 'string' || !name.trim() || name.length > 128 || /[\u0000-\u001f\u007f]/.test(name) || ['__proto__', 'prototype', 'constructor'].includes(name.trim())) throw new TypeError('MCP server name is invalid');
-    const normalized = normalizeConfig(config);
+    const normalized = normalizeConfig(config, { allowPrivateNetwork: this.allowPrivateNetwork });
     const cleanName = name.trim();
-    const old = this.servers.get(cleanName);
-    if (old) void this._stopServer(old);
+    const previous = this.servers.get(cleanName);
     this.configs.set(cleanName, normalized);
+    if (previous && previous.config !== normalized) {
+      // Interrupt an in-flight initialization immediately.  The serialized
+      // lifecycle task below still performs the actual replacement, while the
+      // early stop prevents a broken old server from delaying the new one.
+      void this._stopServer(previous).catch(() => {});
+    }
     if (!this.serverSegments.has(cleanName)) this._allocateServerSegment(cleanName);
-    if (this.started) void this._connectServer(cleanName, normalized);
+    this._enqueueLifecycle(async () => {
+      const current = this.servers.get(cleanName);
+      if (current && current.config === normalized && (current.status === 'starting' || current.status === 'running')) return;
+      if (current) await this._stopServer(current);
+      if (this.configs.get(cleanName) !== normalized) return;
+      if (this.started) await this._connectServer(cleanName, normalized);
+    });
     this._emitStatus();
     return cleanName;
   }
@@ -471,11 +736,12 @@ class McpManager extends EventEmitter {
     const cleanName = name.trim();
     const existed = this.configs.has(cleanName) || this.servers.has(cleanName);
     const server = this.servers.get(cleanName);
-    if (server) void this._stopServer(server);
     this.configs.delete(cleanName);
     this.servers.delete(cleanName);
     this.serverSegments.delete(cleanName);
+    if (server) void this._stopServer(server).catch(() => {});
     this._removeToolsForServer(cleanName);
+    this._enqueueLifecycle(() => this._stopServer(server));
     this._emitStatus();
     return existed;
   }
@@ -485,22 +751,38 @@ class McpManager extends EventEmitter {
   }
 
   async start() {
-    if (this.started) return this.status();
-    this.started = true;
-    this._emitStatus();
-    for (const [name, config] of this.configs) {
-      if (!this.configs.has(name)) continue;
-      await this._connectServer(name, config);
-    }
+    const epoch = this.lifecycleEpoch;
+    await this._enqueueLifecycle(async () => {
+      if (this.started || this.lifecycleEpoch !== epoch) return;
+      this.started = true;
+      this._emitStatus();
+      const entries = [...this.configs.entries()];
+      await Promise.all(entries.map(async ([name, config]) => {
+        if (this.lifecycleEpoch !== epoch || !this.started || this.configs.get(name) !== config) return;
+        try {
+          await this._connectServer(name, config);
+        } catch (error) {
+          this._emitError(error, name);
+        }
+      }));
+    });
     return this.status();
   }
 
   async stop() {
+    // Flip the state and interrupt active requests before joining the queue so
+    // a stuck initialization cannot postpone a reload or shutdown.
+    this.lifecycleEpoch += 1;
     this.started = false;
-    const servers = [...this.servers.values()];
-    for (const server of servers) await this._stopServer(server);
-    this.toolIndex.clear();
-    this._emitStatus();
+    for (const server of [...this.servers.values()]) void this._stopServer(server).catch(() => {});
+    await this._enqueueLifecycle(async () => {
+      this.started = false;
+      this._emitStatus();
+      const servers = [...this.servers.values()];
+      await Promise.all(servers.map((server) => this._stopServer(server)));
+      this.toolIndex.clear();
+      this._emitStatus();
+    });
     return this.status();
   }
 
@@ -512,9 +794,10 @@ class McpManager extends EventEmitter {
       const record = this.toolIndex.get(exposedName);
       if (!record) return this._failure('Unknown MCP tool', `Unknown MCP tool: ${redactString(exposedName.slice(0, 200))}`);
       const server = this.servers.get(record.serverName);
-      if (!server || server.status !== 'running') return this._failure('MCP server unavailable', 'MCP server is not running');
+      if (!server || server.status !== 'running' || (record.serverGeneration !== undefined && record.serverGeneration !== server.generation)) return this._failure('MCP server unavailable', 'MCP server is not running');
       if (args !== undefined && !isObject(args)) return this._failure('Invalid MCP tool arguments', 'Tool arguments must be an object');
       const result = await this._request(server, 'tools/call', { name: record.toolName, arguments: args || {} }, safeContext);
+      if (this.servers.get(record.serverName) !== server || this.configs.get(record.serverName) !== server.config || server.status !== 'running') return this._failure('MCP server unavailable', 'MCP server is not running');
       return this._toolResult(record, result, server);
     } catch (error) {
       return this._failure('MCP tool request failed', safeMessage(error));
@@ -529,25 +812,24 @@ class McpManager extends EventEmitter {
     let text = String(value ?? '');
     for (const config of this.configs.values()) {
       const values = [
+        config.url,
         ...Object.values(config.headers || {}),
         ...Object.values(config.env || {}),
       ];
-      for (const secret of values) {
-        if (typeof secret === 'string' && secret.length >= 3) text = text.split(secret).join('[REDACTED]');
-      }
+      for (const secret of values) text = scrubConfiguredValue(text, secret);
     }
     return text;
   }
 
   _scrubServerSecrets(server, value) {
     let text = String(value ?? '');
+    if (!server) return this._scrubConfiguredSecrets(text);
     const values = [
+      server?.config?.url,
       ...Object.values(server?.config?.headers || {}),
       ...Object.values(server?.config?.env || {}),
     ];
-    for (const secret of values) {
-      if (typeof secret === 'string' && secret.length >= 3) text = text.split(secret).join('[REDACTED]');
-    }
+    for (const secret of values) text = scrubConfiguredValue(text, secret);
     return text;
   }
 
@@ -564,10 +846,14 @@ class McpManager extends EventEmitter {
   }
 
   _newServer(name, config) {
+    const generation = (this.serverGenerations.get(name) || 0) + 1;
+    this.serverGenerations.set(name, generation);
     return {
       name,
       config,
       kind: config.kind,
+      generation,
+      retired: false,
       status: 'stopped',
       error: '',
       child: null,
@@ -579,7 +865,16 @@ class McpManager extends EventEmitter {
       sessionId: null,
       initialized: false,
       tools: [],
+      stopPromise: null,
     };
+  }
+
+  _isCurrentServer(server) {
+    return Boolean(server
+      && !server.retired
+      && server.status !== 'stopping'
+      && this.servers.get(server.name) === server
+      && this.configs.get(server.name) === server.config);
   }
 
   _emitStatus(change = null) {
@@ -591,69 +886,88 @@ class McpManager extends EventEmitter {
   _setServerStatus(server, status, error = '') {
     server.status = status;
     server.error = error ? this._scrubServerSecrets(server, safeMessage(error)).slice(0, 1_000) : '';
+    if (this.servers.get(server.name) !== server || this.configs.get(server.name) !== server.config) return;
     this._emitStatus({
-      server: redactString(server.name).slice(0, 160),
+      server: this._scrubConfiguredSecrets(redactString(server.name)).slice(0, 160),
       status,
       ...(server.error ? { error: server.error } : {}),
     });
   }
 
-  _emitError(error, serverName = '') {
-    const server = this.servers.get(serverName) || [...this.servers.values()].find((item) => item.name === serverName);
-    const message = this._scrubServerSecrets(server, safeMessage(error));
+  _emitError(error, serverName = '', sourceServer = null) {
+    const server = sourceServer || this.servers.get(serverName) || [...this.servers.values()].find((item) => item.name === serverName);
+    if (sourceServer && (this.servers.get(sourceServer.name) !== sourceServer || this.configs.get(sourceServer.name) !== sourceServer.config)) return;
+    const message = server ? this._scrubServerSecrets(server, safeMessage(error)) : this._scrubConfiguredSecrets(safeMessage(error));
     // EventEmitter treats an unhandled `error` event as an exception.  Do not
     // turn an expected MCP/server failure into an application crash.
     if (this.listenerCount('error') > 0) this.emit('error', new Error(message));
-    this.emit('mcpError', { server: redactString(serverName).slice(0, 160), error: message });
+    this.emit('mcpError', { server: this._scrubConfiguredSecrets(redactString(serverName)).slice(0, 160), error: message });
   }
 
   async _connectServer(name, config) {
-    if (!this.configs.has(name)) return;
+    if (this.configs.get(name) !== config) return;
     const old = this.servers.get(name);
-    if (old && (old.status === 'starting' || old.status === 'running')) return;
+    if (old && (old.status === 'starting' || old.status === 'running') && old.config === config) return;
+    if (old && old.status !== 'stopped') await this._stopServer(old);
+    if (this.configs.get(name) !== config) return;
+
     const server = this._newServer(name, config);
     this.servers.set(name, server);
     this._setServerStatus(server, 'starting');
+    const startupController = new AbortController();
+    let startupTimedOut = false;
+    server.controllers.add(startupController);
+    const startupTimer = setTimeout(() => {
+      startupTimedOut = true;
+      startupController.abort();
+    }, this.startupTimeout);
+    const startupContext = { signal: startupController.signal };
     try {
       if (config.kind === 'stdio') {
         this._startStdio(server);
         if (!server.child) throw new Error('stdio process could not be started');
-      } else {
-        if (/\/sse\/?$/i.test(new URL(config.url).pathname)) throw new Error('Legacy HTTP+SSE transport is not supported; use streamable HTTP POST');
+      } else if (/\/sse\/?$/i.test(new URL(config.url).pathname)) {
+        throw new Error('Legacy HTTP+SSE transport is not supported; use streamable HTTP POST');
       }
 
       const initialize = await this._request(server, 'initialize', {
         protocolVersion: this.protocolVersion,
         capabilities: {},
         clientInfo: this.clientInfo,
-      }, {});
-      if (this.servers.get(name) !== server || server.status === 'stopping') return;
+      }, startupContext);
+      if (!this._isCurrentServer(server)) return;
       if (initialize !== undefined && (!isObject(initialize) || (initialize.protocolVersion && initialize.protocolVersion !== this.protocolVersion))) {
         throw new Error('MCP server returned an invalid initialize response');
       }
       server.initialized = true;
-      await this._notify(server, 'notifications/initialized', {});
-      if (this.servers.get(name) !== server || server.status === 'stopping') return;
-      const listed = await this._request(server, 'tools/list', {}, {});
-      if (this.servers.get(name) !== server || server.status === 'stopping') return;
+      await this._notify(server, 'notifications/initialized', {}, startupContext);
+      if (!this._isCurrentServer(server)) return;
+      const listed = await this._request(server, 'tools/list', {}, startupContext);
+      if (!this._isCurrentServer(server)) return;
       const rawTools = Array.isArray(listed) ? listed : listed && Array.isArray(listed.tools) ? listed.tools : null;
       if (!rawTools) throw new Error('MCP server returned an invalid tools/list response');
-      const tools = this._normalizeTools(rawTools, name);
-      this._replaceToolsForServer(name, tools);
+      const tools = this._normalizeTools(rawTools, name, server);
+      if (!this._isCurrentServer(server)) return;
+      this._replaceToolsForServer(name, tools, server);
+      server.tools = tools;
       this._setServerStatus(server, 'running');
     } catch (error) {
-      if (this.servers.get(name) !== server || server.status === 'stopping') return;
-      this._emitError(error, name);
-      this._removeToolsForServer(name);
+      if (!this._isCurrentServer(server)) return;
+      const failure = startupTimedOut ? new Error('MCP startup timed out') : error;
+      this._emitError(failure, name, server);
+      this._removeToolsForServer(name, server.generation);
       this._killChild(server);
-      this._rejectPending(server, error);
+      this._rejectPending(server, failure);
       server.initialized = false;
-      this._setServerStatus(server, 'error', error);
+      this._setServerStatus(server, 'error', failure);
+    } finally {
+      clearTimeout(startupTimer);
+      server.controllers.delete(startupController);
     }
   }
 
   _startStdio(server) {
-    const env = { ...process.env, ...(server.config.env || {}) };
+    const env = buildStdioEnv(server.config.env || {});
     const child = this.spawnImpl(server.config.command, (server.config.args || []).slice(), {
       ...(server.config.cwd ? { cwd: server.config.cwd } : {}),
       env,
@@ -664,33 +978,37 @@ class McpManager extends EventEmitter {
     server.child = child;
     if (child.stdout && typeof child.stdout.on === 'function') {
       child.stdout.on('data', (chunk) => this._consumeStdout(server, chunk));
-      child.stdout.on('error', (error) => this._emitError(error, server.name));
+      child.stdout.on('error', (error) => {
+        if (this._isCurrentServer(server)) this._emitError(error, server.name, server);
+      });
     }
     if (child.stderr && typeof child.stderr.on === 'function') {
       child.stderr.on('data', (chunk) => {
+        if (!this._isCurrentServer(server)) return;
         const text = this._scrubServerSecrets(server, redactString(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk))).slice(-STDERR_RING_CHARS);
         server.stderrRing = `${server.stderrRing}${text}`.slice(-STDERR_RING_CHARS);
       });
-      child.stderr.on('error', (error) => this._emitError(error, server.name));
+      child.stderr.on('error', (error) => {
+        if (this._isCurrentServer(server)) this._emitError(error, server.name, server);
+      });
     }
     if (typeof child.on === 'function') {
       child.on('error', (error) => {
-        this._emitError(error, server.name);
-        if (server.status !== 'stopping') {
-          this._rejectPending(server, error);
-          this._removeToolsForServer(server.name);
-          this._setServerStatus(server, 'error', error);
-        }
+        if (!this._isCurrentServer(server)) return;
+        this._emitError(error, server.name, server);
+        this._rejectPending(server, error);
+        this._removeToolsForServer(server.name, server.generation);
+        this._setServerStatus(server, 'error', error);
       });
       let exited = false;
       const onChildClosed = (code) => {
         if (exited) return;
         exited = true;
-        if (server.status === 'stopping' || !this.started) return;
+        if (!this._isCurrentServer(server) || !this.started) return;
         const error = new Error(`MCP stdio process exited (${code === null || code === undefined ? 'unknown' : code})`);
-        this._emitError(error, server.name);
+        this._emitError(error, server.name, server);
         this._rejectPending(server, error);
-        this._removeToolsForServer(server.name);
+        this._removeToolsForServer(server.name, server.generation);
         this._setServerStatus(server, 'error', error);
       };
       child.on('exit', onChildClosed);
@@ -699,12 +1017,13 @@ class McpManager extends EventEmitter {
   }
 
   _consumeStdout(server, chunk) {
+    if (!this._isCurrentServer(server)) return;
     const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
     server.stdoutBuffer += text;
     if (Buffer.byteLength(server.stdoutBuffer) > MAX_LINE_BYTES * 2) {
       server.stdoutBuffer = '';
       const error = new Error('MCP stdout line exceeded the size limit');
-      this._emitError(error, server.name);
+      this._emitError(error, server.name, server);
       return;
     }
     let newline;
@@ -712,13 +1031,13 @@ class McpManager extends EventEmitter {
       let line = server.stdoutBuffer.slice(0, newline).replace(/\r$/, '').replace(/^\uFEFF/, '');
       server.stdoutBuffer = server.stdoutBuffer.slice(newline + 1);
       if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
-        this._emitError(new Error('MCP stdout line exceeded the size limit'), server.name);
+        this._emitError(new Error('MCP stdout line exceeded the size limit'), server.name, server);
         continue;
       }
       if (!line.trim()) continue;
       let message;
       try { message = JSON.parse(line); } catch {
-        this._emitError(new Error('MCP stdout contained invalid JSON'), server.name);
+        this._emitError(new Error('MCP stdout contained invalid JSON'), server.name, server);
         continue;
       }
       this._handleProtocolMessage(server, message);
@@ -726,8 +1045,9 @@ class McpManager extends EventEmitter {
   }
 
   _handleProtocolMessage(server, message) {
+    if (!this._isCurrentServer(server)) return;
     if (!isObject(message) || message.jsonrpc !== '2.0') {
-      this._emitError(new Error('MCP server sent an invalid JSON-RPC message'), server.name);
+      this._emitError(new Error('MCP server sent an invalid JSON-RPC message'), server.name, server);
       return;
     }
     if (message.id === undefined || message.id === null) return; // notification
@@ -757,12 +1077,13 @@ class McpManager extends EventEmitter {
 
   _requestStdio(server, payload, method, context, notification) {
     if (!server.child || !server.child.stdin || typeof server.child.stdin.write !== 'function') return Promise.reject(new Error('MCP stdio process is unavailable'));
-    if (notification) {
-      try { server.child.stdin.write(`${JSON.stringify(payload)}\n`); return Promise.resolve(); } catch (error) { return Promise.reject(error); }
-    }
-    const id = payload.id;
     const externalSignal = context && context.signal;
     if (externalSignal && externalSignal.aborted) return Promise.reject(new Error('Request cancelled'));
+    let serializedNotification;
+    if (notification) {
+      try { serializedNotification = `${JSON.stringify(payload)}\n`; server.child.stdin.write(serializedNotification); return Promise.resolve(); } catch (error) { return Promise.reject(error); }
+    }
+    const id = payload.id;
     return new Promise((resolve, reject) => {
       let settled = false;
       let timer;
@@ -815,7 +1136,23 @@ class McpManager extends EventEmitter {
     return response.result;
   }
 
+  async _validateHttpTarget(server, context = {}) {
+    let url;
+    try { url = new URL(server.config.url); } catch { throw new Error('MCP HTTP URL is invalid'); }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError('MCP HTTP URL must use http or https');
+    if (url.username || url.password) throw new TypeError('MCP HTTP URL credentials are not allowed');
+    const allowPrivateNetwork = server.config.allowPrivateNetwork === true || this.allowPrivateNetwork === true;
+    const hostname = normalizedHostname(url.hostname);
+    if (!allowPrivateNetwork && isBlockedMcpHostname(hostname)) throw new Error('MCP private-network access requires allowPrivateNetwork:true');
+    const addresses = await lookupAllAddresses(this.lookup, hostname, context, this.requestTimeout);
+    if (!allowPrivateNetwork && addresses.some((item) => isBlockedMcpAddress(item.address))) {
+      throw new Error('MCP HTTP target resolves to a private or reserved address');
+    }
+    return { url: url.toString(), addresses, origin: url.origin };
+  }
+
   async _httpExchange(server, payload, context) {
+    const target = await this._validateHttpTarget(server, context);
     const fetchImpl = this.fetchImpl || (typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null);
     if (typeof fetchImpl !== 'function') throw new Error('HTTP fetch is unavailable');
     const controller = new AbortController();
@@ -828,8 +1165,9 @@ class McpManager extends EventEmitter {
       else externalSignal.addEventListener('abort', onAbort, { once: true });
     }
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.requestTimeout);
+    const configuredHeaders = validateHeaders(server.config.headers);
     const headers = {
-      ...(server.config.headers || {}),
+      ...configuredHeaders,
       Accept: 'application/json, text/event-stream',
       'Content-Type': 'application/json',
       'MCP-Protocol-Version': this.protocolVersion,
@@ -839,13 +1177,19 @@ class McpManager extends EventEmitter {
     try {
       if (controller.signal.aborted) throw new Error('Request cancelled');
       const exchangePromise = Promise.resolve().then(async () => {
-        const response = await fetchImpl(server.config.url, {
+        const response = await fetchImpl(target.url, {
           method: 'POST',
           headers,
           body: JSON.stringify(payload),
           signal: controller.signal,
           redirect: 'error',
         });
+        if (response && response.redirected) throw new Error('MCP HTTP redirects are not allowed');
+        if (response && response.url) {
+          let responseUrl;
+          try { responseUrl = new URL(response.url, target.url); } catch { throw new Error('MCP HTTP response URL is invalid'); }
+          if (responseUrl.origin !== target.origin) throw new Error('MCP HTTP redirects are not allowed');
+        }
         const body = await readResponseBody(response, this.maxResponseBytes);
         return { response, body };
       });
@@ -919,18 +1263,18 @@ class McpManager extends EventEmitter {
     }
   }
 
-  _notify(server, method, params) {
-    return this._request(server, method, params, {}, { notification: true });
+  _notify(server, method, params, context = {}) {
+    return this._request(server, method, params, context, { notification: true });
   }
 
-  _normalizeTools(rawTools, serverName) {
+  _normalizeTools(rawTools, serverName, server = null) {
     const tools = [];
     for (const item of rawTools.slice(0, MAX_SCHEMA_PROPERTIES * 4)) {
       if (!isObject(item) || typeof item.name !== 'string') continue;
       const toolName = item.name.trim();
       if (!toolName || toolName.length > MAX_INTERNAL_TOOL_NAME || /[\u0000-\u001f\u007f]/.test(toolName)) continue;
       const parameters = normalizeInputSchema(item.inputSchema);
-      tools.push({
+      const record = {
         serverName,
         toolName,
         exposedName: '',
@@ -942,13 +1286,15 @@ class McpManager extends EventEmitter {
             parameters,
           },
         },
-      });
+      };
+      tools.push(server ? this._scrubServerValue(server, record) : record);
     }
     return tools;
   }
 
-  _replaceToolsForServer(serverName, tools) {
-    this._removeToolsForServer(serverName);
+  _replaceToolsForServer(serverName, tools, expectedServer = null) {
+    if (expectedServer && !this._isCurrentServer(expectedServer)) return;
+    this._removeToolsForServer(serverName, expectedServer ? null : undefined);
     const serverSegment = this.serverSegments.get(serverName) || safeSegment(serverName);
     for (const record of tools) {
       const toolSegment = safeSegment(record.toolName, 'tool', 32);
@@ -962,33 +1308,52 @@ class McpManager extends EventEmitter {
         suffix += 1;
         if (suffix > 1000) break;
       }
+      record.serverGeneration = expectedServer?.generation ?? record.serverGeneration;
       record.exposedName = exposed;
       record.definition.function.name = exposed;
       this.toolIndex.set(exposed, record);
     }
   }
 
-  _removeToolsForServer(serverName) {
+  _removeToolsForServer(serverName, generation = null) {
     for (const [exposed, record] of this.toolIndex) {
-      if (record.serverName === serverName) this.toolIndex.delete(exposed);
+      if (record.serverName === serverName && (generation === null || record.serverGeneration === generation)) this.toolIndex.delete(exposed);
     }
   }
 
   _toolResult(record, result, server) {
     const bounded = this._boundToolResult(result, server);
+    const exposedName = this._scrubServerSecrets(server, redactString(record.exposedName)).slice(0, MAX_EXPOSED_NAME);
     if (bounded.isError) {
       return {
         ok: false,
-        summary: `MCP tool ${record.exposedName} returned an error`,
+        summary: `MCP tool ${exposedName} returned an error`,
         data: bounded,
-        error: bounded.text ? bounded.text.slice(0, 2_000) : 'MCP tool reported an error',
+        error: bounded.text ? this._scrubServerSecrets(server, redactString(bounded.text)).slice(0, 2_000) : 'MCP tool reported an error',
       };
     }
     return {
       ok: true,
-      summary: `MCP tool ${record.exposedName} completed`,
+      summary: `MCP tool ${exposedName} completed`,
       data: bounded,
     };
+  }
+
+  _scrubServerValue(server, value, seen = new WeakSet()) {
+    if (typeof value === 'string') return this._scrubServerSecrets(server, redactString(value));
+    if (Array.isArray(value)) {
+      if (seen.has(value)) return '[Circular]';
+      seen.add(value);
+      return value.map((item) => this._scrubServerValue(server, item, seen));
+    }
+    if (isObject(value)) {
+      if (seen.has(value)) return '[Circular]';
+      seen.add(value);
+      const output = {};
+      for (const [key, item] of Object.entries(value)) output[key] = this._scrubServerValue(server, item, seen);
+      return output;
+    }
+    return value;
   }
 
   _boundToolResult(result, server = null) {
@@ -1035,7 +1400,7 @@ class McpManager extends EventEmitter {
           if (shown.length < clean.length) output.truncated = true;
           output.content.push({ type: 'text', text: shown });
         } else if (item.type === 'resource' && isObject(item.resource) && typeof item.resource.text === 'string') {
-          const clean = redactString(item.resource.text);
+          const clean = this._scrubServerSecrets(server, redactString(item.resource.text));
           addText(clean);
           const room = Math.max(0, this.maxToolResultChars - contentTotal);
           const shown = clean.slice(0, room);
@@ -1053,7 +1418,7 @@ class McpManager extends EventEmitter {
     if (result.structuredContent !== undefined) output.content.push({ type: 'structuredContent', summary: '[structured content omitted]' });
     output.text = chunks.join('\n').slice(0, this.maxToolResultChars);
     if (total > this.maxToolResultChars) output.truncated = true;
-    output.content = output.content.slice(0, 256).map((item) => redact(item));
+    output.content = this._scrubServerValue(server, redact(output.content.slice(0, 256)));
     output.text = this._scrubServerSecrets(server, redactString(output.text));
     return output;
   }
@@ -1070,37 +1435,53 @@ class McpManager extends EventEmitter {
 
   async _stopServer(server) {
     if (!server) return;
-    const wasStarting = server.status === 'starting';
-    server.status = 'stopping';
-    for (const controller of server.controllers) {
-      try { controller.abort(); } catch { /* best effort during shutdown */ }
-    }
-    server.controllers.clear();
-    this._rejectPending(server, new Error('MCP server stopped'));
-    server.initialized = false;
-    server.sessionId = null;
-    server.stdoutBuffer = '';
-    this._killChild(server);
-    this._removeToolsForServer(server.name);
-    // Give a well-behaved child a chance to observe kill, but never make stop()
-    // depend on a process that has already disappeared.
-    if (server.child && typeof server.child.once === 'function') {
-      await new Promise((resolve) => {
-        let done = false;
-        let timer;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          resolve();
-        };
-        server.child.once('close', finish);
-        server.child.once('exit', finish);
-        timer = setTimeout(finish, Math.min(100, this.requestTimeout));
-      });
-    }
-    server.child = null;
-    this._setServerStatus(server, wasStarting ? 'stopped' : 'stopped');
+    if (server.stopPromise) return server.stopPromise;
+    server.stopPromise = (async () => {
+      server.retired = true;
+      server.status = 'stopping';
+      for (const controller of server.controllers) {
+        try { controller.abort(); } catch { /* best effort during shutdown */ }
+      }
+      server.controllers.clear();
+      this._rejectPending(server, new Error('MCP server stopped'));
+      server.initialized = false;
+      server.sessionId = null;
+      server.stdoutBuffer = '';
+      server.tools = [];
+      this._removeToolsForServer(server.name, server.generation);
+      const child = server.child;
+      // Give a well-behaved child a chance to observe kill, but never make
+      // stop() depend on a process that has already disappeared.
+      if (child && typeof child.once === 'function') {
+        try {
+          await new Promise((resolve) => {
+            let done = false;
+            let timer;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              resolve();
+            };
+            child.once('close', finish);
+            child.once('exit', finish);
+            timer = setTimeout(finish, Math.min(100, this.requestTimeout));
+            this._killChild(server);
+          });
+        } catch {
+          // Cleanup must remain best effort even for a nonconforming child.
+          this._killChild(server);
+        }
+      } else {
+        this._killChild(server);
+      }
+      server.child = null;
+      if (this.servers.get(server.name) === server) {
+        server.retired = false;
+        this._setServerStatus(server, 'stopped');
+      }
+    })();
+    return server.stopPromise;
   }
 }
 

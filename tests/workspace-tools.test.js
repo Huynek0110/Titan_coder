@@ -248,6 +248,139 @@ test('context tools, move, create, delete, and trash return compact workspace da
   assert.equal(new Set(definitionNames).size, 15);
 });
 
+test('sensitive-file policy blocks direct secret reads and scan disclosure by default', async (t) => {
+  const root = await makeTempDirectory('workspace-sensitive-');
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const envSecret = 'ENV_SECRET_SHOULD_NOT_LEAK';
+  const keySecret = 'KEY_SECRET_SHOULD_NOT_LEAK';
+  await fsp.writeFile(path.join(root, '.env'), `API_KEY=${envSecret}\n`);
+  await fsp.writeFile(
+    path.join(root, 'server.key'),
+    `-----BEGIN PRIVATE KEY-----\n${keySecret}\n-----END PRIVATE KEY-----\n`,
+  );
+  await fsp.writeFile(path.join(root, 'credentials.json'), JSON.stringify({ token: keySecret }));
+  await fsp.mkdir(path.join(root, 'config'), { recursive: true });
+  await fsp.writeFile(
+    path.join(root, 'config', 'secrets.json'),
+    JSON.stringify({ apiKey: keySecret }),
+  );
+  await fsp.writeFile(
+    path.join(root, 'config', 'settings.json'),
+    JSON.stringify({ database: { password: keySecret } }),
+  );
+
+  const tools = new WorkspaceTools({ root });
+  const envRead = await tools.execute('read_file', { path: '.env' });
+  assert.equal(envRead.ok, false);
+  assert.equal(envRead.data.content, '[REDACTED]');
+  assert.match(envRead.error, /sensitive|blocked/i);
+  assert.doesNotMatch(JSON.stringify(envRead), new RegExp(envSecret));
+
+  const keyRead = await tools.execute('read_file', { path: 'server.key' });
+  assert.equal(keyRead.ok, false);
+  assert.doesNotMatch(JSON.stringify(keyRead), new RegExp(keySecret));
+
+  const configRead = await tools.execute('read_file', { path: 'config/settings.json' });
+  assert.equal(configRead.ok, false);
+  assert.doesNotMatch(JSON.stringify(configRead), new RegExp(keySecret));
+
+  const many = await tools.execute('read_many_files', {
+    paths: ['.env', 'server.key', 'credentials.json', 'config/settings.json'],
+  });
+  assert.equal(many.ok, false);
+  assert.equal(many.data.sensitiveFilesBlocked, 4);
+  assert.doesNotMatch(JSON.stringify(many), new RegExp(`${envSecret}|${keySecret}`));
+
+  const search = await tools.execute('search_text', { query: envSecret });
+  assert.equal(search.ok, true);
+  assert.doesNotMatch(JSON.stringify(search), new RegExp(envSecret));
+  assert.ok(search.data.sensitiveFilesSkipped >= 1);
+
+  const symbols = await tools.execute('find_symbols', { path: 'config/secrets.json' });
+  assert.equal(symbols.ok, true);
+  assert.doesNotMatch(JSON.stringify(symbols), new RegExp(keySecret));
+
+  const allowed = await tools.execute('read_file', { path: '.env' }, { allowSecretRead: true });
+  assert.equal(allowed.ok, true);
+  assert.match(allowed.data.content, new RegExp(envSecret));
+
+  const moved = await tools.execute('move_file', { from: '.env', to: 'renamed.txt' });
+  assert.equal(moved.ok, true);
+  const movedRead = await tools.execute('read_file', { path: 'renamed.txt' });
+  assert.equal(movedRead.ok, false);
+  assert.doesNotMatch(JSON.stringify(movedRead), new RegExp(envSecret));
+});
+
+test('workspace cancellation propagates AbortError and checks before edit commits', async (t) => {
+  const root = await makeTempDirectory('workspace-cancel-');
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  await fsp.writeFile(path.join(root, 'safe.txt'), 'before');
+  await fsp.mkdir(path.join(root, 'src'), { recursive: true });
+  await fsp.writeFile(path.join(root, 'src', 'safe.js'), 'export const answer = 1;\n');
+  const tools = new WorkspaceTools({ root });
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await assert.rejects(
+    tools.execute('read_file', { path: 'safe.txt' }, { signal: preAborted.signal }),
+    (error) => error?.name === 'AbortError',
+  );
+
+  const walkController = new AbortController();
+  const walk = tools.execute('find_symbols', { path: 'src' }, { signal: walkController.signal });
+  queueMicrotask(() => walkController.abort());
+  await assert.rejects(walk, (error) => error?.name === 'AbortError');
+
+  const editController = new AbortController();
+  const originalReadUtf8 = tools._readUtf8.bind(tools);
+  tools._readUtf8 = async (...args) => {
+    const result = await originalReadUtf8(...args);
+    editController.abort();
+    return result;
+  };
+  await assert.rejects(
+    tools.execute('edit_file', {
+      path: 'safe.txt',
+      oldText: 'before',
+      newText: 'after',
+    }, { signal: editController.signal }),
+    (error) => error?.name === 'AbortError',
+  );
+  assert.equal(await fsp.readFile(path.join(root, 'safe.txt'), 'utf8'), 'before');
+
+  const writeController = new AbortController();
+  writeController.abort();
+  await assert.rejects(
+    tools.execute('write_file', { path: 'cancelled.txt', content: 'no' }, { signal: writeController.signal }),
+    (error) => error?.name === 'AbortError',
+  );
+  await assert.rejects(fsp.access(path.join(root, 'cancelled.txt')), (error) => error?.code === 'ENOENT');
+});
+
+test('unsafe search patterns and oversized globs are rejected', async (t) => {
+  const root = await makeTempDirectory('workspace-patterns-');
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  await fsp.writeFile(path.join(root, 'sample.js'), 'const value = 1;\\n');
+  const tools = new WorkspaceTools({ root });
+
+  const normalRegex = await tools.execute('search_text', {
+    query: '(?:const|let)\\s+[A-Za-z_$][\\w$]*',
+    isRegex: true,
+  });
+  assert.equal(normalRegex.ok, true, normalRegex.error || normalRegex.summary);
+
+  const unsafeRegex = await tools.execute('search_text', {
+    query: '(a+)+$',
+    isRegex: true,
+  });
+  assert.equal(unsafeRegex.ok, false);
+  assert.match(unsafeRegex.error, /unsafe|expensive/i);
+
+  const oversizedGlob = await tools.execute('find_files', { pattern: '*'.repeat(65) });
+  assert.equal(oversizedGlob.ok, false);
+  assert.match(oversizedGlob.error, /unsafe|expensive|pattern/i);
+});
+
 test('delete_path refuses to delete the workspace root', async (t) => {
   const root = await makeTempDirectory('workspace-delete-');
   t.after(() => fsp.rm(root, { recursive: true, force: true }));

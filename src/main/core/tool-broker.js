@@ -54,21 +54,22 @@ function isMcpTool(name, definition = null) {
  */
 function isMutatingTool(name, definition = null) {
   const metadata = metadataFor(definition);
+  const toolName = String(name || '');
+  if (CORE_CONTROL_TOOLS.has(toolName)) return false;
+  if (MUTATING_TOOLS.has(toolName)) return true;
   if (metadata.mutating === true) return true;
   if (metadata.readOnly === true) return false;
   if (metadata.readOnly === false) return true;
-  if (CORE_CONTROL_TOOLS.has(String(name || ''))) return false;
-  if (MUTATING_TOOLS.has(String(name || ''))) return true;
-  return !KNOWN_READ_ONLY_TOOLS.has(String(name || ''));
+  return !KNOWN_READ_ONLY_TOOLS.has(toolName);
 }
 
 function isReadOnlyTool(name, definition = null) {
   if (isMcpTool(name, definition)) return false;
+  if (isMutatingTool(name, definition)) return false;
   const metadata = metadataFor(definition);
   if (metadata.readOnly === true) return true;
   if (metadata.readOnly === false || metadata.mutating === true) return false;
-  if (CORE_CONTROL_TOOLS.has(String(name || ''))) return false;
-  return !isMutatingTool(name, definition) && !isMcpTool(name, definition);
+  return !isMcpTool(name, definition);
 }
 
 function toolRisk(name, definition = null) {
@@ -203,8 +204,8 @@ const INTENT_TOOLS = {
   explain: ['project_overview', 'project_map', 'list_directory', 'find_files', 'search_text', 'read_file', 'find_symbols', 'read_many_files'],
   plan: ['project_overview', 'project_map', 'find_files', 'search_text', 'read_file', 'read_many_files', 'find_symbols', 'git_status', 'git_diff', 'list_project_tasks'],
   test: ['project_overview', 'list_project_tasks', 'read_file', 'search_text', 'run_test', 'run_lint', 'git_diff', 'git_status'],
-  fix: ['project_overview', 'search_text', 'read_file', 'read_many_files', 'edit_file', 'apply_patch', 'run_test', 'git_diff'],
-  edit: ['project_overview', 'list_directory', 'find_files', 'search_text', 'read_file', 'edit_file', 'write_file', 'apply_patch', 'run_test', 'git_diff', 'git_status'],
+  fix: ['project_overview', 'search_text', 'read_file', 'edit_file', 'apply_patch', 'run_test'],
+  edit: ['project_overview', 'search_text', 'read_file', 'edit_file', 'write_file', 'run_test'],
 };
 
 function isMcpSource(source) {
@@ -226,6 +227,30 @@ function safeEventText(value, maximum = 1600) {
   return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
 }
 
+function safeEventArguments(value, depth = 0, seen = new WeakSet()) {
+  if (depth > 3) return '[arguments nested too deeply]';
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return safeEventText(value, 800);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value !== 'object') return safeEventText(String(value), 800);
+  if (seen.has(value)) return '[circular arguments]';
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) return value.slice(0, 30).map((item) => safeEventArguments(item, depth + 1, seen));
+    const output = {};
+    for (const [key, item] of Object.entries(value).slice(0, 40)) {
+      if (['authorization', 'cookie', 'set-cookie', 'password', 'passwd', 'secret', 'token', 'apikey', 'api_key', 'access_token', 'refresh_token', 'client_secret', 'private_key'].includes(key.toLowerCase())) {
+        output[key] = '[REDACTED]';
+      } else {
+        output[key] = safeEventArguments(item, depth + 1, seen);
+      }
+    }
+    return output;
+  } finally {
+    seen.delete(value);
+  }
+}
+
 function eventResult(envelope) {
   const result = {
     ok: Boolean(envelope?.ok),
@@ -236,6 +261,10 @@ function eventResult(envelope) {
   if (envelope?.exitCode !== undefined) result.exitCode = envelope.exitCode;
   if (envelope?.timedOut !== undefined) result.timedOut = Boolean(envelope.timedOut);
   return result;
+}
+
+function approvalRequired(mode) {
+  return ['ask', 'manual', 'always'].includes(String(mode || '').toLowerCase());
 }
 
 function modelDefinition(definition) {
@@ -378,7 +407,7 @@ class ToolBroker {
       for (const definition of this._usableDefinitions(this._definitions(source, selectedMode, true), selectedMode)) {
         const name = definition?.function?.name;
         if (!name || seen.has(name)) continue;
-        if (selectedMode === 'plan' && (isMutatingTool(name, definition) || isMcpTool(name, definition))) continue;
+        if (selectedMode !== 'agent' && (isMutatingTool(name, definition) || isMcpTool(name, definition))) continue;
         seen.add(name);
         definitions.push(modelDefinition(definition));
       }
@@ -425,7 +454,7 @@ class ToolBroker {
     const add = (definition) => {
       const name = definition?.function?.name;
       if (!name || seen.has(name) || !this._hasValidEntry(name, definition, selectedMode)) return;
-      if (selectedMode === 'plan' && (isMutatingTool(name, definition) || isMcpTool(name, definition))) return;
+      if (selectedMode !== 'agent' && (isMutatingTool(name, definition) || isMcpTool(name, definition))) return;
       if (options.subagent && (isMutatingTool(name, definition) || isMcpTool(name, definition))) return;
       if (selected.length >= maxTools + (options.includeMcp ? 3 : 0)) return;
       selected.push(modelDefinition(definition));
@@ -445,7 +474,7 @@ class ToolBroker {
   }
 
   requiresApproval(name, mode, definition = this.getEntry(name)?.definition || null) {
-    if (String(mode || '').toLowerCase() !== 'ask') return false;
+    if (!approvalRequired(mode)) return false;
     return isMutatingTool(name, definition) || isMcpTool(name, definition);
   }
 
@@ -460,9 +489,13 @@ class ToolBroker {
       }
     }
     const risk = toolRisk(name, entry.definition);
+    const mode = String(context.mode || 'agent').toLowerCase();
+    if (risk.mutating && (mode !== 'agent' || context.subagentId)) {
+      return { ok: false, error: `Mutation bị chặn: ${name} chỉ được chạy trong Agent mode.` };
+    }
     if (context.fallback === true && (risk.mutating || risk.mcp)
       && context.allowFallbackTools !== true
-      && String(context.approvalMode || 'automatic').toLowerCase() !== 'ask') {
+      && !approvalRequired(context.approvalMode)) {
       return { ok: false, error: 'Fallback tool cần allowFallbackTools=true hoặc approval mode ask.' };
     }
     // Mutation authority is explicit. A read-only call can use the broker
@@ -470,7 +503,7 @@ class ToolBroker {
     // the separately-approved ask-mode fallback path).
     const approvalMode = String(context.approvalMode || 'automatic').toLowerCase();
     const allowMutation = context.allowMutation === true
-      || (context.fallback === true && approvalMode === 'ask' && context.allowMutation !== false);
+      || (context.fallback === true && approvalRequired(approvalMode) && context.allowMutation !== false);
     if (risk.mutating && !allowMutation) {
       return { ok: false, error: `Mutation bị chặn: ${name} không được phép trong ngữ cảnh này.` };
     }
@@ -526,7 +559,8 @@ class ToolBroker {
         approved = await this.interactionProvider({
           type: 'approval',
           tool: name,
-          arguments: safeEventText(parsed),
+          arguments: safeEventArguments(parsed),
+          argumentsTruncated: stringify(parsed).length > 8_000,
           fallback: safeContext.fallback === true,
           signal: safeContext.signal,
         });
@@ -540,7 +574,8 @@ class ToolBroker {
     }
 
     const startedAt = Date.now();
-    emit({ type: 'tool-start', callId: safeContext.callId, name, arguments: safeEventText(parsed), startedAt });
+    const argumentsTruncated = stringify(parsed).length > 8_000;
+    emit({ type: 'tool-start', callId: safeContext.callId, name, arguments: safeEventArguments(parsed), argumentsTruncated, startedAt });
     try {
       const result = await record.source.execute(name, parsed, {
         ...safeContext,
@@ -548,7 +583,7 @@ class ToolBroker {
         mode: requestedMode,
         fallback: safeContext.fallback === true,
         onOutput: (chunk) => {
-          try { emit({ type: 'tool-output', callId: safeContext.callId, name, chunk: String(chunk).slice(-4000) }); } catch { /* output is advisory */ }
+          try { emit({ type: 'tool-output', callId: safeContext.callId, name, chunk: safeEventText(String(chunk).slice(-4000), 4000) }); } catch { /* output is advisory */ }
         },
       });
       if (result?.name === 'AbortError' || result?.code === 'ABORT_ERR') {
@@ -585,4 +620,6 @@ module.exports = {
   safeEventText,
   eventResult,
   modelDefinition,
+  approvalRequired,
+  safeEventArguments,
 };

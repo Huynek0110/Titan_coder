@@ -12,7 +12,23 @@ const DEFAULT_TIMEOUT_MS = 120000;
 const MAX_PROCESS_LOG_BYTES = OUTPUT_CAP;
 const REDACTION_HOLD_MAX = 2048;
 const MAX_PROCESS_RECORDS = 256;
+const MAX_PROCESS_LOG_FILES = MAX_PROCESS_RECORDS;
+const MAX_PROCESS_LOG_TOTAL_BYTES = MAX_PROCESS_LOG_FILES * MAX_PROCESS_LOG_BYTES;
+const MAX_MEMORY_BYTES = 1024 * 1024;
+const PROCESS_LOG_FLUSH_MS = 100;
+const PROCESS_CLOSE_DEADLINE_MS = 2000;
+const PROCESS_FORCE_GRACE_MS = 250;
 const REDACTION = '[REDACTED]';
+
+// Child commands get a deliberately small, platform-appropriate environment.
+// An allow-list is safer than trying to enumerate every vendor-specific
+// secret-looking variable (for example DATABASE_URL or SSH_AUTH_SOCK).
+const INHERITED_ENV_NAMES = Object.freeze([
+  'PATH',
+  'SystemRoot',
+  'ComSpec',
+]);
+const PROCESS_LOG_FILE_RE = /^proc_[A-Za-z0-9_-]+\.log$/;
 
 const TOOL_NAMES = Object.freeze([
   'run_command',
@@ -67,13 +83,48 @@ const ALLOWED_ARGUMENTS = Object.freeze({
   open_path: new Set(['path', 'reveal']),
 });
 
-const SECRET_ENV_NAME = /(?:pass|passwd|password|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)/i;
 const SECRET_NAME_SOURCE = '(?:(?:[A-Za-z0-9]+[_\\-])*(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|secret[_-]?key|password|passwd|pwd|secret|token))';
 const SECRET_PREFIX_RE = new RegExp(`(?:["']?${SECRET_NAME_SOURCE}["']?\\s*[:=]\\s*)$`, 'i');
 const SAFE_PROCESS_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isAbortError(error) {
+  return Boolean(error && (error.name === 'AbortError' || error.code === 'ABORT_ERR'));
+}
+
+function createAbortError(message = 'Operation aborted') {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted === true) throw createAbortError();
+}
+
+function awaitWithAbort(value, signal, message = 'Operation aborted') {
+  if (!signal || typeof signal.addEventListener !== 'function') return Promise.resolve(value);
+  if (signal.aborted === true) return Promise.reject(createAbortError(message));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let onAbort = null;
+    const finish = (callback, result) => {
+      if (settled) return;
+      settled = true;
+      if (typeof onAbort === 'function') signal.removeEventListener?.('abort', onAbort);
+      callback(result);
+    };
+    onAbort = () => finish(reject, createAbortError(message));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(value).then(
+      (result) => finish(resolve, result),
+      (error) => finish(reject, error),
+    );
+  });
 }
 
 function randomToken() {
@@ -146,60 +197,108 @@ function classifyCommand(command) {
   );
   return {
     command: true,
+    commandExecution: 'shell',
+    execution: shellSyntax ? 'shell' : 'direct',
     shell: shellSyntax,
+    processTree: true,
     mutating,
     readOnly,
-    requiresApproval: false,
+    // Approval remains a broker/context decision.  This flag documents that
+    // shell execution is mutation-capable without changing automatic-agent
+    // mode or forcing a prompt here.
+    requiresApproval: mutating,
+    approval: 'context',
   };
 }
 
 class BoundedLog {
   constructor(max = MAX_PROCESS_LOG_BYTES) {
-    this.max = Math.max(0, max);
+    this.max = Math.max(0, Number.isFinite(Number(max)) ? Math.floor(Number(max)) : MAX_PROCESS_LOG_BYTES);
     this.chunks = [];
     this.total = 0;
+    this.bytes = 0;
     this.truncated = false;
+    this._cache = new Map();
+  }
+
+  _invalidate() {
+    this._cache.clear();
+  }
+
+  _fitText(text, maxBytes) {
+    if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+    let low = 0;
+    let high = text.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (Buffer.byteLength(text.slice(0, middle), 'utf8') <= maxBytes) low = middle;
+      else high = middle - 1;
+    }
+    let result = text.slice(0, low);
+    if (result.endsWith('\uD800') || result.endsWith('\uDC00')) result = result.slice(0, -1);
+    return result;
   }
 
   append(stream, value) {
     if (value === undefined || value === null) return '';
-    let text = redactSecrets(value);
+    let text;
+    try {
+      text = String(value);
+    } catch {
+      text = '[UNPRINTABLE]';
+    }
     if (!text) return '';
 
-    const remaining = this.max - this.total;
+    const remaining = this.max - this.bytes;
     if (remaining <= 0) {
       this.truncated = true;
       return '';
     }
 
-    if (text.length > remaining) {
-      text = text.slice(0, remaining);
+    // Do not run the redaction expressions over an unbounded chunk. The
+    // pending-secret logic in SystemTools retains a small suffix when a
+    // secret-looking token can span chunks.
+    const rawLimit = Math.max(remaining, Math.min(text.length, remaining + REDACTION_HOLD_MAX));
+    if (text.length > rawLimit) {
+      text = text.slice(0, rawLimit);
       this.truncated = true;
     }
+    text = redactSecrets(text);
+    if (!text) return '';
+
+    const fitted = this._fitText(text, remaining);
+    if (fitted.length < text.length) this.truncated = true;
+    text = fitted;
+    if (!text) return '';
 
     this.chunks.push({ stream, text });
     this.total += text.length;
+    this.bytes += Buffer.byteLength(text, 'utf8');
+    this._invalidate();
     return text;
   }
 
-  snapshot(stream) {
-    let text = '';
+  snapshot(stream = null) {
+    const key = stream || '__combined__';
+    if (this._cache.has(key)) return this._cache.get(key);
+    const parts = [];
     for (const chunk of this.chunks) {
-      if (!stream || chunk.stream === stream) text += chunk.text;
+      if (!stream || chunk.stream === stream) parts.push(chunk.text);
     }
-    return text;
+    // Array#join avoids the repeated string concatenation that made the old
+    // implementation quadratic for a chatty process.
+    const result = parts.join('');
+    this._cache.set(key, result);
+    return result;
   }
 
   values() {
-    let stdout = '';
-    let stderr = '';
-    let combined = '';
-    for (const chunk of this.chunks) {
-      combined += chunk.text;
-      if (chunk.stream === 'stdout') stdout += chunk.text;
-      if (chunk.stream === 'stderr') stderr += chunk.text;
-    }
-    return { stdout, stderr, combined, truncated: this.truncated };
+    return {
+      stdout: this.snapshot('stdout'),
+      stderr: this.snapshot('stderr'),
+      combined: this.snapshot(),
+      truncated: this.truncated,
+    };
   }
 }
 
@@ -243,6 +342,22 @@ function boundedInteger(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, Math.floor(number)));
 }
 
+function normalizeConfiguredEnvironment(value) {
+  if (!isObject(value)) return Object.create(null);
+  const result = Object.create(null);
+  for (const [key, item] of Object.entries(value)) {
+    if (!key || key.includes('\\0') || key.includes('=')) continue;
+    if (item === undefined || item === null) continue;
+    try {
+      result[String(key)] = String(item);
+    } catch {
+      // Ignore an unusable configured value rather than forwarding a getter's
+      // exception into process creation.
+    }
+  }
+  return result;
+}
+
 class SystemTools {
   constructor(options = {}, platformServices = {}) {
     const opts = isObject(options) ? options : {};
@@ -256,9 +371,29 @@ class SystemTools {
     );
     this.defaultSignal = opts.signal;
     this.mode = String(opts.mode || 'agent').toLowerCase();
+    this.terminationTimeoutMs = boundedInteger(
+      opts.terminationTimeoutMs ?? opts.processCloseTimeoutMs,
+      PROCESS_CLOSE_DEADLINE_MS,
+      100,
+      30000,
+    );
+    this.maxProcessLogBytes = boundedInteger(
+      opts.maxProcessLogBytes ?? opts.maxLogBytes,
+      MAX_PROCESS_LOG_BYTES,
+      0,
+      MAX_PROCESS_LOG_BYTES,
+    );
+    this._configuredEnv = normalizeConfiguredEnvironment(
+      opts.env ?? opts.environment ?? opts.childEnv ?? opts.configuredEnv,
+    );
 
     this.services = { ...nestedServices, ...services };
-    for (const name of ['execFile', 'spawn', 'taskList', 'openPath', 'revealPath']) {
+    const serviceEnv = normalizeConfiguredEnvironment(this.services.env);
+    for (const [key, value] of Object.entries(serviceEnv)) this._configuredEnv[key] = value;
+    for (const name of [
+      'execFile', 'spawn', 'taskList', 'openPath', 'revealPath',
+      'killTree', 'terminateTree', 'taskkill', 'processKill', 'killProcessGroup', 'killProcessTree',
+    ]) {
       if (typeof opts[name] === 'function') this.services[name] = opts[name];
     }
     if (typeof this.services.execFile !== 'function') {
@@ -272,6 +407,7 @@ class SystemTools {
     this._path = this.platform === 'win32' ? path.win32 : path;
     this.processes = new Map();
     fs.mkdirSync(this.logDir, { recursive: true });
+    this._cleanupProcessLogs();
   }
 
   definitions(mode = 'agent') {
@@ -287,15 +423,26 @@ class SystemTools {
       readOnly: false,
       mutating: true,
       command: true,
+      commandExecution: 'shell',
+      execution: 'shell',
       shell: true,
-      requiresApproval: false,
+      processTree: true,
+      // The broker decides whether approval is needed from the caller's
+      // explicit mode. Keep automatic-agent execution available while making
+      // the mutation/approval contract visible to other definition consumers.
+      requiresApproval: true,
+      approval: 'context',
     };
     const gitTool = {
       readOnly: true,
       mutating: false,
       command: true,
+      commandExecution: 'direct',
+      execution: 'direct',
       shell: false,
+      processTree: true,
       requiresApproval: false,
+      approval: 'context',
     };
 
     const definitions = [
@@ -351,7 +498,10 @@ class SystemTools {
           mutating: true,
           command: false,
           shell: false,
+          processControl: true,
+          processTree: true,
           requiresApproval: false,
+          approval: 'context',
         },
       ),
       makeDefinition(
@@ -487,7 +637,9 @@ class SystemTools {
           command: false,
           shell: false,
           external: true,
+          canonicalContainment: true,
           requiresApproval: false,
+          approval: 'context',
         },
       ),
     ];
@@ -507,7 +659,10 @@ class SystemTools {
 
   async execute(name, args = {}, context = {}) {
     const toolName = String(name || '');
+    const safeContext = isObject(context) ? { ...context } : {};
+    if (!safeContext.signal && this.defaultSignal) safeContext.signal = this.defaultSignal;
     try {
+      throwIfAborted(safeContext.signal);
       if (!TOOL_NAMES.includes(toolName)) {
         throw new Error(`Unknown system tool: ${toolName || '(empty)'}`);
       }
@@ -519,7 +674,6 @@ class SystemTools {
         if (!allowed.has(key)) throw new Error(`Unexpected argument: ${key}`);
       }
 
-      const safeContext = isObject(context) ? context : {};
       const effectiveMode = String(safeContext.mode || this.mode || 'agent').toLowerCase();
       if (effectiveMode === 'plan') {
         if (!PLAN_TOOL_NAMES.has(toolName)) {
@@ -530,45 +684,67 @@ class SystemTools {
         }
       }
 
+      let result;
       switch (toolName) {
         case 'run_command':
-          return await this._runCommand(safeArgs, safeContext);
+          result = await this._runCommand(safeArgs, safeContext);
+          break;
         case 'start_process':
-          return this._startProcess(safeArgs, safeContext);
+          result = this._startProcess(safeArgs, safeContext);
+          break;
         case 'read_process':
-          return this._readProcess(safeArgs);
+          result = this._readProcess(safeArgs, safeContext);
+          break;
         case 'list_processes':
-          return await this._listProcesses();
+          result = await this._listProcesses(safeContext);
+          break;
         case 'stop_process':
-          return await this._stopProcess(safeArgs);
+          result = await this._stopProcess(safeArgs, safeContext);
+          break;
         case 'git_status':
-          return await this._gitStatus(safeArgs, safeContext);
+          result = await this._gitStatus(safeArgs, safeContext);
+          break;
         case 'git_diff':
-          return await this._gitDiff(safeArgs, safeContext);
+          result = await this._gitDiff(safeArgs, safeContext);
+          break;
         case 'git_log':
-          return await this._gitLog(safeArgs, safeContext);
+          result = await this._gitLog(safeArgs, safeContext);
+          break;
         case 'git_blame':
-          return await this._gitBlame(safeArgs, safeContext);
+          result = await this._gitBlame(safeArgs, safeContext);
+          break;
         case 'list_project_tasks':
-          return this._listProjectTasks();
+          result = this._listProjectTasks(safeContext);
+          break;
         case 'run_test':
-          return await this._runTest(safeArgs, safeContext);
+          result = await this._runTest(safeArgs, safeContext);
+          break;
         case 'run_lint':
-          return await this._runLint(safeArgs, safeContext);
+          result = await this._runLint(safeArgs, safeContext);
+          break;
         case 'run_format':
-          return await this._runFormat(safeArgs, safeContext);
+          result = await this._runFormat(safeArgs, safeContext);
+          break;
         case 'system_info':
-          return this._systemInfo();
+          result = this._systemInfo();
+          break;
         case 'current_time':
-          return this._currentTime();
+          result = this._currentTime();
+          break;
         case 'project_memory':
-          return this._projectMemory(safeArgs);
+          result = this._projectMemory(safeArgs, safeContext);
+          break;
         case 'open_path':
-          return await this._openPath(safeArgs);
+          result = await this._openPath(safeArgs, safeContext);
+          break;
         default:
           throw new Error(`Unknown system tool: ${toolName}`);
       }
+      throwIfAborted(safeContext.signal);
+      return result;
     } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (safeContext.signal && safeContext.signal.aborted === true) throw createAbortError();
       return this._failure('System tool failed', error);
     }
   }
@@ -604,10 +780,40 @@ class SystemTools {
     return value;
   }
 
-  _safeEnvironment() {
+  _safeEnvironment(extra = null) {
     const env = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (!SECRET_ENV_NAME.test(key)) env[key] = value;
+    const setEnv = (key, value) => {
+      Object.defineProperty(env, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    };
+    const source = isObject(process.env) ? process.env : {};
+    const entries = Object.entries(source);
+
+    // Keep only variables needed to locate the shell and a few harmless
+    // runtime values. In particular, do not copy arbitrary application
+    // secrets into every child process.
+    for (const wanted of INHERITED_ENV_NAMES) {
+      const wantedLower = wanted.toLowerCase();
+      const exact = entries.find(([key]) => key === wanted);
+      const match = exact || entries.find(([key]) => key.toLowerCase() === wantedLower);
+      if (match && match[1] !== undefined) setEnv(wanted, String(match[1]));
+    }
+
+    const configured = normalizeConfiguredEnvironment({
+      ...this._configuredEnv,
+      ...normalizeConfiguredEnvironment(extra),
+    });
+    for (const [key, value] of Object.entries(configured)) {
+      if (this.platform === 'win32') {
+        for (const existing of Object.keys(env)) {
+          if (existing.toLowerCase() === key.toLowerCase()) delete env[existing];
+        }
+      }
+      setEnv(key, value);
     }
     return env;
   }
@@ -620,19 +826,35 @@ class SystemTools {
       left = left.toLowerCase();
       right = right.toLowerCase();
     }
-    const relative = api.relative(left, right);
-    return relative === '' || (
-      relative !== '..' &&
-      !relative.startsWith(`..${api.sep}`) &&
-      !api.isAbsolute(relative)
-    );
+    try {
+      const relative = api.relative(left, right);
+      return relative === '' || (
+        relative !== '..' &&
+        !relative.startsWith(`..${api.sep}`) &&
+        !api.isAbsolute(relative)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  _pathMayLeadToRoot(root, candidate) {
+    return this._pathIsWithin(root, candidate) || this._pathIsWithin(candidate, root);
+  }
+
+  _realpath(filePath) {
+    const resolver = fs.realpathSync.native || fs.realpathSync;
+    return resolver(filePath);
+  }
+
+  _canonicalPathKey(filePath) {
+    const value = this._path.normalize(String(filePath));
+    return this.platform === 'win32' ? value.toLowerCase() : value;
   }
 
   _realpathIfPresent(filePath) {
     try {
-      if (fs.existsSync(filePath) || this._isLink(filePath)) {
-        return fs.realpathSync.native ? fs.realpathSync.native(filePath) : fs.realpathSync(filePath);
-      }
+      if (fs.existsSync(filePath) || this._isLink(filePath)) return this._realpath(filePath);
     } catch {
       return null;
     }
@@ -647,105 +869,116 @@ class SystemTools {
     }
   }
 
+  _canonicalizePathSpelling(filePath, rootReal, { preserveDotSegments = false } = {}) {
+    const api = this._path;
+    const raw = String(filePath);
+    const absolute = preserveDotSegments && api.isAbsolute(raw)
+      ? raw
+      : api.resolve(raw);
+    const parsed = api.parse(absolute);
+    const rootPrefix = parsed.root || api.sep;
+    let current = rootPrefix;
+    try {
+      if (fs.existsSync(current)) current = this._realpath(current);
+    } catch {
+      // The normal containment check below will fail closed if the root
+      // itself cannot be canonicalized.
+    }
+    let reachedRoot = this._canonicalPathKey(current) === this._canonicalPathKey(rootReal);
+    if (!reachedRoot && !this._pathMayLeadToRoot(rootReal, current)) {
+      throw new Error('Path must stay within the workspace');
+    }
+
+    const remainder = absolute.slice(rootPrefix.length).split(/[\\/]+/).filter(Boolean);
+    const suffix = [];
+    for (let index = 0; index < remainder.length; index += 1) {
+      const component = remainder[index];
+      if (component === '.') continue;
+      if (component === '..') {
+        current = api.dirname(current);
+        if (reachedRoot ? !this._pathIsWithin(rootReal, current) : !this._pathMayLeadToRoot(rootReal, current)) {
+          throw new Error('Path must stay within the workspace');
+        }
+        continue;
+      }
+      const candidate = api.join(current, component);
+      let stat = null;
+      try {
+        stat = fs.lstatSync(candidate);
+      } catch {
+        stat = null;
+      }
+      if (!stat) {
+        suffix.push(...remainder.slice(index));
+        const real = api.resolve(current, ...suffix);
+        if (!this._pathIsWithin(rootReal, real)) {
+          throw new Error('Path must stay within the workspace');
+        }
+        return { real, exists: false, stat: null };
+      }
+      let real;
+      try {
+        real = this._realpath(candidate);
+      } catch {
+        throw new Error('Path could not be resolved safely');
+      }
+      if (reachedRoot ? !this._pathIsWithin(rootReal, real) : !this._pathMayLeadToRoot(rootReal, real)) {
+        throw new Error('Path must stay within the workspace');
+      }
+      current = real;
+      if (this._canonicalPathKey(real) === this._canonicalPathKey(rootReal)) reachedRoot = true;
+    }
+    return { real: current, exists: true, stat: null };
+  }
+
   _resolveWorkspacePath(value, { mustExist = false } = {}) {
     const input = this._requireString(value, 'path', { max: 4096 });
     if (/[\r\n\u0000]/.test(input)) throw new Error('Path contains an invalid character');
     const api = this._path;
+
+    // Device paths, UNC/device prefixes, and alternate data streams are not
+    // meaningful workspace-relative paths and can bypass a lexical `relative`
+    // check on Windows. Reject them before resolving the spelling.
+    if (this.platform === 'win32') {
+      if (/^(?:\\\\[?.]\\|\\\\\.\\)/.test(input)) throw new Error('Path contains an invalid character');
+      const parsed = api.parse(input);
+      if (input.slice(parsed.root.length).includes(':')) {
+        throw new Error('Path contains an invalid character');
+      }
+    }
+
     const absolute = api.resolve(this.root, input);
     if (!this._pathIsWithin(this.root, absolute)) {
       throw new Error('Path must stay within the workspace');
     }
 
-    const rootReal = this._realpathIfPresent(this.root) || this.root;
+    const rootReal = this._realpathIfPresent(this.root);
+    if (!rootReal) throw new Error('Workspace root could not be resolved safely');
 
-    // Check the unnormalized spelling as well. On POSIX, a path such as
-    // link/../file can traverse a symlink before the lexical `..` is removed.
+    // Check both the normalized spelling and the unnormalized spelling. The
+    // latter matters for paths such as link/../file, where a symlink can be
+    // traversed before the lexical `..` is removed.
     const rawAbsolute = api.isAbsolute(input) ? input : `${this.root}${api.sep}${input}`;
-    let rawStat = null;
-    try {
-      rawStat = fs.lstatSync(rawAbsolute);
-    } catch {
-      rawStat = null;
+    const rawCanonical = this._canonicalizePathSpelling(rawAbsolute, rootReal, { preserveDotSegments: true });
+    if (!rawCanonical.exists && mustExist) throw new Error('Path does not exist');
+    const canonical = this._canonicalizePathSpelling(absolute, rootReal);
+    if (!canonical.exists && mustExist) throw new Error('Path does not exist');
+    if (!this._pathIsWithin(rootReal, canonical.real) || !this._pathIsWithin(rootReal, rawCanonical.real)) {
+      throw new Error('Path must stay within the workspace');
     }
-    if (rawStat) {
-      let rawReal;
+
+    if (mustExist) {
       try {
-        rawReal = fs.realpathSync.native ? fs.realpathSync.native(rawAbsolute) : fs.realpathSync(rawAbsolute);
+        // stat (rather than lstat) ensures a broken symlink cannot be handed
+        // to the desktop open callback.
+        fs.statSync(absolute);
       } catch {
-        throw new Error('Path could not be resolved safely');
-      }
-      if (!this._pathIsWithin(rootReal, rawReal)) {
-        throw new Error('Path must stay within the workspace');
-      }
-    } else {
-      let rawCursor = rawAbsolute;
-      while (!fs.existsSync(rawCursor) && !this._isLink(rawCursor)) {
-        const parent = api.dirname(rawCursor);
-        if (parent === rawCursor) break;
-        rawCursor = parent;
-      }
-      if (this._isLink(rawCursor)) {
-        throw new Error('Path could not be resolved safely');
-      }
-      const rawAncestorReal = this._realpathIfPresent(rawCursor);
-      if (rawAncestorReal && !this._pathIsWithin(rootReal, rawAncestorReal)) {
-        throw new Error('Path must stay within the workspace');
+        throw new Error('Path does not exist');
       }
     }
-
-    let stat = null;
-    try {
-      stat = fs.lstatSync(absolute);
-    } catch {
-      stat = null;
-    }
-
-    if (stat) {
-      let real;
-      try {
-        real = fs.realpathSync.native ? fs.realpathSync.native(absolute) : fs.realpathSync(absolute);
-      } catch {
-        throw new Error('Path could not be resolved safely');
-      }
-      if (!this._pathIsWithin(rootReal, real)) {
-        throw new Error('Path must stay within the workspace');
-      }
-      if (mustExist) {
-        try {
-          fs.statSync(absolute);
-        } catch {
-          throw new Error('Path does not exist');
-        }
-      }
-      return {
-        absolute,
-        real,
-        relative: api.relative(this.root, absolute) || '.',
-      };
-    }
-
-    // Walk up to the nearest existing ancestor. This catches an escape through an
-    // existing symlink even when the final requested file has not been created yet.
-    let cursor = absolute;
-    const suffix = [];
-    while (!fs.existsSync(cursor)) {
-      const parent = api.dirname(cursor);
-      if (parent === cursor) break;
-      suffix.unshift(api.basename(cursor));
-      cursor = parent;
-    }
-    const ancestorReal = this._realpathIfPresent(cursor);
-    if (ancestorReal) {
-      const reconstructed = api.resolve(ancestorReal, ...suffix);
-      if (!this._pathIsWithin(rootReal, reconstructed)) {
-        throw new Error('Path must stay within the workspace');
-      }
-    }
-
-    if (mustExist) throw new Error('Path does not exist');
     return {
       absolute,
-      real: absolute,
+      real: canonical.real,
       relative: api.relative(this.root, absolute) || '.',
     };
   }
@@ -756,6 +989,14 @@ class SystemTools {
   }
 
   _createProcessRecord(command, options = {}) {
+    const signal = options.signal || this.defaultSignal;
+    throwIfAborted(signal);
+    this._pruneProcessRecords();
+    const activeCount = [...this.processes.values()].filter((record) => !record._finished).length;
+    if (activeCount >= MAX_PROCESS_RECORDS) {
+      throw new Error('Too many active system-tool processes');
+    }
+
     const id = `proc_${randomToken()}`;
     const record = {
       id,
@@ -773,18 +1014,37 @@ class SystemTools {
       aborted: false,
       killed: false,
       error: null,
-      log: new BoundedLog(options.maxLog || MAX_PROCESS_LOG_BYTES),
+      terminationUnconfirmed: false,
+      closeUnconfirmed: false,
+      terminationConfirmed: false,
+      log: new BoundedLog(Math.min(
+        this.maxProcessLogBytes,
+        options.maxLog === undefined ? this.maxProcessLogBytes : Math.max(0, Number(options.maxLog) || 0),
+      )),
       logPath: path.join(this.logDir, `${id}.log`),
       child: null,
       persistent: Boolean(options.persistent),
       detached: this.platform !== 'win32',
+      _signal: signal || null,
+      _env: isObject(options.env) ? options.env : null,
       _finished: false,
+      _operationResolved: false,
       _listeners: [],
       _timeoutTimer: null,
       _forceFinishTimer: null,
-      _forceFinishTimer2: null,
+      _terminationDeadlineTimer: null,
+      _closeDeadlineTimer: null,
+      _logFlushTimer: null,
+      _logDirty: true,
       _closeSeen: false,
+      _exitSeen: false,
+      _terminationRequested: false,
+      _spawnFailed: false,
+      _treeKillRequested: false,
+      _treeKillConfirmed: false,
+      _treeKillFailed: false,
       _forceTried: false,
+      _terminationMessage: null,
       _onOutput: options.onOutput,
       _pendingOutput: { stdout: '', stderr: '' },
       _detachSignal: null,
@@ -794,13 +1054,13 @@ class SystemTools {
       record._resolve = resolve;
     });
     this.processes.set(id, record);
-    this._flushProcessLog(record);
-
-    const signal = options.signal || this.defaultSignal;
-    if (signal && signal.aborted) {
+    try {
+      throwIfAborted(signal);
+      this._flushProcessLog(record);
+    } catch (error) {
       record.aborted = true;
       this._finishProcess(record);
-      return record;
+      throw error;
     }
 
     let child;
@@ -811,7 +1071,7 @@ class SystemTools {
         windowsHide: true,
         detached: this.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: this._safeEnvironment(),
+        env: this._safeEnvironment(options.env),
       });
     } catch (error) {
       record.error = redactSecrets(errorMessage(error));
@@ -829,22 +1089,21 @@ class SystemTools {
     }
 
     this._attachProcess(record);
-    if (record._finished) return record;
-    if (!record._finished) record.status = 'running';
+    record.status = record._finished ? record.status : 'running';
     if (signal) this._watchProcessSignal(record, signal);
     if (options.timeoutMs) {
       record._timeoutTimer = setTimeout(() => {
         if (record._finished) return;
         record.timedOut = true;
         this._terminateChild(record, true);
-        this._scheduleForceFinish(record);
       }, options.timeoutMs);
     }
     if (child.exitCode !== undefined && child.exitCode !== null) {
       record.exitCode = normalizeExitCode(child.exitCode);
-      this._finishProcess(record);
+      this._noteProcessExit(record, record.exitCode, null);
     }
     this._pruneProcessRecords();
+    this._cleanupProcessLogs();
     return record;
   }
 
@@ -859,39 +1118,70 @@ class SystemTools {
     };
 
     addListener(child.stdout, 'data', (chunk) => {
-      this._appendProcessOutput(record, 'stdout', chunk);
+      if (!record._finished) this._appendProcessOutput(record, 'stdout', chunk);
     });
     addListener(child.stderr, 'data', (chunk) => {
-      this._appendProcessOutput(record, 'stderr', chunk);
+      if (!record._finished) this._appendProcessOutput(record, 'stderr', chunk);
     });
     if (!child.stdout || (typeof child.stdout.on !== 'function' && typeof child.stdout.once !== 'function')) {
       addListener(child, 'data', (chunk) => {
-        this._appendProcessOutput(record, 'stdout', chunk);
+        if (!record._finished) this._appendProcessOutput(record, 'stdout', chunk);
       });
     }
 
     addListener(child, 'error', (error) => {
-      record.error = redactSecrets(errorMessage(error));
+      if (record._finished) return;
+      if (isAbortError(error)) {
+        record.aborted = true;
+      } else {
+        record.error = redactSecrets(errorMessage(error));
+      }
       if (!record.pid) {
+        record._spawnFailed = true;
         this._finishProcess(record);
       } else {
         this._terminateChild(record, true);
-        this._scheduleForceFinish(record);
       }
     });
     addListener(child, 'exit', (code, signal) => {
-      record.exitCode = normalizeExitCode(code);
-      record.signal = signal || null;
-      if (!record._closeSeen) {
-        setTimeout(() => this._finishProcess(record), 100);
-      }
+      if (record._finished) return;
+      this._noteProcessExit(record, code, signal);
     });
     addListener(child, 'close', (code, signal) => {
+      if (record._closeSeen) return;
       record._closeSeen = true;
       record.exitCode = normalizeExitCode(code);
       record.signal = signal || null;
-      this._finishProcess(record);
+      record.closeUnconfirmed = false;
+      if (!record._terminationRequested) record._terminationMessage = null;
+      this._maybeFinishProcess(record);
     });
+  }
+
+  _noteProcessExit(record, code, signal) {
+    if (record._finished) return;
+    record._exitSeen = true;
+    if (code !== undefined) record.exitCode = normalizeExitCode(code);
+    if (signal !== undefined && signal !== null) record.signal = signal;
+    this._scheduleCloseDeadline(record);
+  }
+
+  _scheduleCloseDeadline(record) {
+    if (record._finished || record._closeDeadlineTimer || record._closeSeen) return;
+    record._closeDeadlineTimer = setTimeout(() => {
+      record._closeDeadlineTimer = null;
+      if (record._finished || record._closeSeen) return;
+      record.closeUnconfirmed = true;
+      record.status = record._terminationRequested ? 'terminationUnconfirmed' : 'closeUnconfirmed';
+      record._terminationMessage = 'Process close was not observed before the deadline';
+      this._resolveProcess(record);
+    }, this.terminationTimeoutMs);
+  }
+
+  _resolveProcess(record) {
+    if (!record || record._operationResolved) return;
+    record._operationResolved = true;
+    if (typeof record._resolve === 'function') record._resolve(this._processSnapshot(record, true));
   }
 
   _watchProcessSignal(record, signal) {
@@ -899,7 +1189,6 @@ class SystemTools {
       if (record._finished) return;
       record.aborted = true;
       this._terminateChild(record, true);
-      this._scheduleForceFinish(record);
     };
     record._detachSignal = () => {
       if (typeof signal.removeEventListener === 'function') {
@@ -921,10 +1210,8 @@ class SystemTools {
 
   _emitProcessText(record, stream, value) {
     const accepted = record.log.append(stream, value);
-    if (!accepted) {
-      if (record.log.truncated) this._flushProcessLog(record);
-      return;
-    }
+    if (!accepted) return;
+    record._logDirty = true;
     const onOutput = record._onOutput;
     if (typeof onOutput === 'function') {
       try {
@@ -934,7 +1221,7 @@ class SystemTools {
         // Streaming callbacks are untrusted and must not affect the child.
       }
     }
-    this._flushProcessLog(record);
+    this._scheduleProcessLogFlush(record);
   }
 
   _appendProcessOutput(record, stream, value) {
@@ -945,7 +1232,12 @@ class SystemTools {
       text = '[UNPRINTABLE]';
     }
     const pending = record._pendingOutput[stream] || '';
-    const combined = pending + text;
+    let combined = pending + text;
+    const inputLimit = Math.max(record.log.max, REDACTION_HOLD_MAX * 2) + REDACTION_HOLD_MAX;
+    if (combined.length > inputLimit) {
+      combined = combined.slice(0, inputLimit);
+      record.log.truncated = true;
+    }
     if (combined && this._mightContinueSecret(combined)) {
       const keepFrom = Math.max(0, combined.length - REDACTION_HOLD_MAX);
       if (keepFrom > 0) this._emitProcessText(record, stream, combined.slice(0, keepFrom));
@@ -966,9 +1258,78 @@ class SystemTools {
     }
   }
 
+  _markTreeKillResult(record, error = null) {
+    if (!record || record._finished) return;
+    if (error) {
+      record._treeKillFailed = true;
+      record._treeKillConfirmed = false;
+      if (this.platform === 'win32') record._forceTried = false;
+      record.terminationConfirmed = false;
+      record._terminationMessage = redactSecrets(errorMessage(error));
+      return;
+    }
+    record._treeKillConfirmed = true;
+    record._treeKillFailed = false;
+    record.terminationConfirmed = true;
+    record.terminationUnconfirmed = false;
+    record.closeUnconfirmed = false;
+    record._terminationMessage = null;
+    this._maybeFinishProcess(record);
+  }
+
+  _tryInjectedTreeKill(record, force) {
+    const service = this.services.killTree || this.services.terminateTree || this.services.taskkill || this.services.killProcessTree;
+    if (typeof service !== 'function') return false;
+    try {
+      record._treeKillRequested = true;
+      const result = service(record.pid, { force: Boolean(force), tree: true, platform: this.platform });
+      if (result && typeof result.then === 'function') {
+        result.then(
+          () => this._markTreeKillResult(record),
+          (error) => {
+            this._markTreeKillResult(record, error);
+            this._fallbackChildKill(record, true);
+          },
+        );
+        return true;
+      }
+      if (result !== false) {
+        this._markTreeKillResult(record);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      this._markTreeKillResult(record, error);
+      return false;
+    }
+  }
+
+  _fallbackChildKill(record, force, { treeConfirmed = false } = {}) {
+    if (!record || record._finished) return false;
+    const child = record.child;
+    if (!child || typeof child.kill !== 'function') return false;
+    if (treeConfirmed) record._treeKillConfirmed = true;
+    try {
+      const killed = child.kill(force ? 'SIGKILL' : 'SIGTERM');
+      if (killed === false) {
+        record._treeKillConfirmed = false;
+        this._markTreeKillResult(record, new Error('Child process could not be signalled'));
+        return false;
+      }
+      return true;
+    } catch (error) {
+      record._treeKillConfirmed = false;
+      this._markTreeKillResult(record, error);
+      return false;
+    }
+  }
+
   _terminateChild(record, force = false, schedule = true) {
     if (!record || record._finished) return;
     record.killed = true;
+    record._terminationRequested = true;
+    if (force || this.platform === 'win32') record._forceTried = true;
+    if (!record._finished && record.status !== 'terminationUnconfirmed') record.status = 'terminating';
     const child = record.child;
     if (!child) {
       this._finishProcess(record);
@@ -976,53 +1337,117 @@ class SystemTools {
     }
 
     if (this.platform === 'win32') {
+      let requested = false;
       if (record.pid) {
-        try {
-          const taskArgs = ['/PID', String(record.pid), '/T'];
-          if (force) taskArgs.push('/F');
-          const killer = this.services.spawn(
-            'taskkill',
-            taskArgs,
-            {
-              cwd: this.root,
-              shell: false,
-              windowsHide: true,
-              stdio: 'ignore',
-              env: this._safeEnvironment(),
-            },
-          );
-          if (killer && typeof killer.on === 'function') killer.on('error', () => {});
-        } catch {
-          if (typeof child.kill === 'function') child.kill(force ? 'SIGKILL' : 'SIGTERM');
+        requested = this._tryInjectedTreeKill(record, force);
+        if (!requested) {
+          try {
+            // Always use /F here. A timeout, abort, or explicit stop must not
+            // leave a shell descendant behind merely because a graceful
+            // taskkill did not finish before the bounded deadline.
+            const taskArgs = ['/PID', String(record.pid), '/T', '/F'];
+            const killer = this.services.spawn(
+              'taskkill',
+              taskArgs,
+              {
+                cwd: this.root,
+                shell: false,
+                windowsHide: true,
+                stdio: 'ignore',
+                detached: false,
+                env: this._safeEnvironment(record._env),
+              },
+            );
+            requested = Boolean(killer);
+            record._treeKillRequested = requested;
+            if (killer) {
+              const onKillerError = (error) => {
+                this._markTreeKillResult(record, error);
+                this._fallbackChildKill(record, true);
+              };
+              const onKillerClose = (code) => {
+                if (code === 0) this._markTreeKillResult(record);
+                else this._markTreeKillResult(record, new Error(`taskkill exited with code ${code ?? 'unknown'}`));
+              };
+              if (typeof killer.once === 'function') {
+                killer.once('error', onKillerError);
+                killer.once('close', onKillerClose);
+              } else if (typeof killer.on === 'function') {
+                killer.on('error', onKillerError);
+                killer.on('close', onKillerClose);
+              }
+            }
+          } catch (error) {
+            this._markTreeKillResult(record, error);
+          }
         }
-      } else if (typeof child.kill === 'function') {
-        child.kill(force ? 'SIGKILL' : 'SIGTERM');
+      }
+      if (!requested || record._treeKillFailed) {
+        // A taskkill executable is not available in an injected environment.
+        // The direct child kill is only a fallback; it is not treated as proof
+        // that descendants are gone, so the close deadline remains in force.
+        this._fallbackChildKill(record, force);
       }
     } else {
       const signal = force ? 'SIGKILL' : 'SIGTERM';
       let groupKilled = false;
-      if (!this._injectedSpawn && record.detached && record.pid && typeof process.kill === 'function') {
+      const processKill = this.services.processKill || this.services.killProcessGroup;
+      if (record.detached && record.pid && typeof processKill === 'function') {
+        try {
+          processKill(-record.pid, signal);
+          groupKilled = true;
+        } catch (error) {
+          this._markTreeKillResult(record, error);
+        }
+      } else if (!this._injectedSpawn && record.detached && record.pid && typeof process.kill === 'function') {
         try {
           process.kill(-record.pid, signal);
           groupKilled = true;
-        } catch {
-          groupKilled = false;
+        } catch (error) {
+          // ESRCH means the process group is already gone, so there cannot be
+          // a remaining member of this tree to report as unconfirmed.
+          groupKilled = Boolean(error && error.code === 'ESRCH');
         }
       }
-      if (!groupKilled && typeof child.kill === 'function') {
-        try {
-          child.kill(signal);
-        } catch {
-          // The process may have exited between the state check and the signal.
-        }
+      if (groupKilled) {
+        this._markTreeKillResult(record);
+      } else {
+        // Test doubles and platforms without a process-group primitive can
+        // still stop their direct child, but the result is only considered a
+        // tree result when the injected service explicitly confirms it.
+        this._fallbackChildKill(record, force, {
+          treeConfirmed: this._injectedSpawn && typeof processKill !== 'function',
+        });
       }
     }
 
-    if (schedule && !record._closeSeen) this._scheduleForceFinish(record);
+    if (schedule) this._scheduleForceFinish(record);
+  }
+
+  _scheduleTerminationDeadline(record) {
+    if (record._terminationDeadlineTimer || record._finished) return;
+    record._terminationDeadlineTimer = setTimeout(() => {
+      record._terminationDeadlineTimer = null;
+      if (record._finished) return;
+      if (record._forceFinishTimer) {
+        clearTimeout(record._forceFinishTimer);
+        record._forceFinishTimer = null;
+      }
+      if (record._timeoutTimer) {
+        clearTimeout(record._timeoutTimer);
+        record._timeoutTimer = null;
+      }
+      record.terminationUnconfirmed = true;
+      record.status = 'terminationUnconfirmed';
+      record._terminationMessage = 'Process-tree termination could not be confirmed before the deadline';
+      this._resolveProcess(record);
+    }, this.terminationTimeoutMs);
   }
 
   _scheduleForceFinish(record) {
-    if (record._forceFinishTimer || record._finished) return;
+    if (record._finished) return;
+    this._scheduleTerminationDeadline(record);
+    if (record._forceFinishTimer) return;
     record._forceFinishTimer = setTimeout(() => {
       record._forceFinishTimer = null;
       if (record._finished) return;
@@ -1030,17 +1455,29 @@ class SystemTools {
         record._forceTried = true;
         this._terminateChild(record, true, false);
       }
-      if (record._finished) return;
-      record._forceFinishTimer2 = setTimeout(() => this._finishProcess(record), 250);
-    }, 500);
+      this._scheduleTerminationDeadline(record);
+    }, PROCESS_FORCE_GRACE_MS);
+  }
+
+  _maybeFinishProcess(record) {
+    if (!record || record._finished || !record._closeSeen) return;
+    if (record._terminationRequested && !record._treeKillConfirmed) return;
+    this._finishProcess(record);
   }
 
   _finishProcess(record) {
     if (!record || record._finished) return;
+    // A close event without a confirmed tree kill is not enough to declare a
+    // terminated process finished. Keep the record observable and let the
+    // bounded deadline report the uncertainty instead.
+    if (record.child && !record._closeSeen && !record._spawnFailed) return;
+    if (record.child && record._terminationRequested && !record._treeKillConfirmed && !record._spawnFailed) return;
     record._finished = true;
     if (record._timeoutTimer) clearTimeout(record._timeoutTimer);
     if (record._forceFinishTimer) clearTimeout(record._forceFinishTimer);
-    if (record._forceFinishTimer2) clearTimeout(record._forceFinishTimer2);
+    if (record._terminationDeadlineTimer) clearTimeout(record._terminationDeadlineTimer);
+    if (record._closeDeadlineTimer) clearTimeout(record._closeDeadlineTimer);
+    if (record._logFlushTimer) clearTimeout(record._logFlushTimer);
     if (typeof record._detachSignal === 'function') record._detachSignal();
     this._flushPendingOutput(record, true);
 
@@ -1055,26 +1492,55 @@ class SystemTools {
     if (record.aborted) record.status = 'aborted';
     else if (record.timedOut) record.status = 'timedOut';
     else if (record.error) record.status = 'error';
+    else if (record.terminationUnconfirmed) record.status = 'terminationUnconfirmed';
+    else if (record.closeUnconfirmed) record.status = 'closeUnconfirmed';
     else record.status = 'exited';
 
     record.finishedAt = new Date().toISOString();
     record.durationMs = Date.now() - record.startedMs;
     this._flushProcessLog(record);
-    if (typeof record._resolve === 'function') record._resolve(this._processSnapshot(record, true));
+    this._resolveProcess(record);
+    this._pruneProcessRecords();
+    this._cleanupProcessLogs();
   }
 
-  _flushProcessLog(record) {
+  _scheduleProcessLogFlush(record) {
+    if (!record || record._finished || record._logFlushTimer || !record._logDirty) return;
+    if (record._signal && record._signal.aborted) return;
+    record._logFlushTimer = setTimeout(() => {
+      record._logFlushTimer = null;
+      if (!record._finished) this._flushProcessLog(record);
+    }, PROCESS_LOG_FLUSH_MS);
+    if (typeof record._logFlushTimer.unref === 'function') record._logFlushTimer.unref();
+  }
+
+  _flushProcessLog(record, force = false) {
+    if (!record) return;
+    if (!force && !record._logDirty) return;
+    // Do not commit new output to disk after the caller has aborted the
+    // operation. The already-redacted in-memory bounded log remains available
+    // to the current caller, but no new filesystem side effect is introduced.
+    if (record._signal && record._signal.aborted) return;
+    let fd = null;
     try {
       if (this._isLink(record.logPath)) {
         record.logError = 'Process log is a symlink';
         return;
       }
-      fs.writeFileSync(
-        record.logPath,
-        record.log.snapshot(),
-        { encoding: 'utf8', mode: 0o600 },
-      );
+      const constants = fs.constants || {};
+      const flags = (constants.O_WRONLY || 1)
+        | (constants.O_CREAT || 0)
+        | (constants.O_TRUNC || 0)
+        | (constants.O_NOFOLLOW || 0);
+      fd = fs.openSync(record.logPath, flags, 0o600);
+      fs.writeFileSync(fd, record.log.snapshot(), { encoding: 'utf8' });
+      fs.closeSync(fd);
+      fd = null;
+      record._logDirty = false;
     } catch (error) {
+      if (fd !== null) {
+        try { fs.closeSync(fd); } catch { /* best effort */ }
+      }
       record.logError = redactSecrets(errorMessage(error));
     }
   }
@@ -1096,6 +1562,10 @@ class SystemTools {
       timedOut: Boolean(record.timedOut),
       aborted: Boolean(record.aborted),
       killed: Boolean(record.killed),
+      terminationRequested: Boolean(record._terminationRequested),
+      terminationConfirmed: Boolean(record._treeKillConfirmed),
+      terminationUnconfirmed: Boolean(record.terminationUnconfirmed),
+      closeUnconfirmed: Boolean(record.closeUnconfirmed),
       truncated: Boolean(logs.truncated),
       logPath: record.logPath,
     };
@@ -1105,6 +1575,7 @@ class SystemTools {
       snapshot.output = logs.combined;
     }
     if (record.error) snapshot.error = redactSecrets(record.error);
+    if (record._terminationMessage && !record.error) snapshot.error = redactSecrets(record._terminationMessage);
     if (record.logError) snapshot.logError = redactSecrets(record.logError);
     return snapshot;
   }
@@ -1138,19 +1609,77 @@ class SystemTools {
     }
   }
 
-  async _runCommand(args, context) {
+  _cleanupProcessLogs() {
+    let names;
+    try {
+      names = fs.readdirSync(this.logDir);
+    } catch {
+      return;
+    }
+    const active = new Set(
+      [...this.processes.values()]
+        .filter((record) => !record._finished)
+        .map((record) => path.basename(record.logPath)),
+    );
+    const candidates = [];
+    let activeCount = 0;
+    let activeBytes = 0;
+    for (const name of active) {
+      const filePath = path.join(this.logDir, name);
+      try {
+        const stat = fs.lstatSync(filePath);
+        activeCount += 1;
+        activeBytes += Number.isFinite(stat.size) ? stat.size : 0;
+      } catch {
+        // The record may have completed between the snapshot and stat.
+      }
+    }
+    let totalBytes = 0;
+    for (const name of names) {
+      if (!PROCESS_LOG_FILE_RE.test(name) || active.has(name)) continue;
+      const filePath = path.join(this.logDir, name);
+      let stat;
+      try {
+        stat = fs.lstatSync(filePath);
+      } catch {
+        continue;
+      }
+      if (!stat.isFile() && !stat.isSymbolicLink()) continue;
+      totalBytes += Number.isFinite(stat.size) ? stat.size : 0;
+      candidates.push({ name, filePath, mtimeMs: Number(stat.mtimeMs) || 0, size: Number(stat.size) || 0 });
+    }
+    candidates.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
+    let index = 0;
+    while (
+      index < candidates.length &&
+      (activeCount + candidates.length - index > MAX_PROCESS_LOG_FILES || activeBytes + totalBytes > MAX_PROCESS_LOG_TOTAL_BYTES)
+    ) {
+      const candidate = candidates[index++];
+      try {
+        fs.unlinkSync(candidate.filePath);
+        totalBytes -= candidate.size;
+      } catch {
+        // Best effort: a concurrently replaced file must not break execution.
+      }
+    }
+  }
+
+  async _runCommand(args, context = {}) {
+    const signal = context.signal;
+    throwIfAborted(signal);
     const command = this._requireString(args.command, 'command', { max: 100000 });
     const timeoutMs = args.timeoutMs === undefined
       ? DEFAULT_TIMEOUT_MS
       : boundedInteger(args.timeoutMs, DEFAULT_TIMEOUT_MS, 1, MAX_TIMEOUT_MS);
     const record = this._createProcessRecord(command, {
       persistent: false,
-      signal: context.signal,
+      signal,
       timeoutMs,
+      env: context.env,
       onOutput: context.onOutput,
     });
-    record._onOutput = context.onOutput;
     const result = await record.promise;
+    throwIfAborted(signal);
     const data = {
       ...result,
       command: redactSecrets(command),
@@ -1161,8 +1690,13 @@ class SystemTools {
       stderr: result.stderr || '',
     };
 
-    if (result.aborted) {
-      return this._failure('Command aborted', new Error('Command aborted'), data);
+    if (result.aborted) throw createAbortError('Command aborted');
+    if (result.terminationUnconfirmed || result.closeUnconfirmed) {
+      return this._failure(
+        result.terminationUnconfirmed ? 'Command termination could not be confirmed' : 'Command close could not be confirmed',
+        new Error(result.error || 'Process close could not be confirmed'),
+        data,
+      );
     }
     if (result.timedOut) {
       return this._failure('Command timed out', new Error('Command timed out'), data);
@@ -1180,7 +1714,9 @@ class SystemTools {
     return this._success('Command completed', data);
   }
 
-  _startProcess(args, context) {
+  _startProcess(args, context = {}) {
+    const signal = context.signal;
+    throwIfAborted(signal);
     const command = this._requireString(args.command, 'command', { max: 100000 });
     let name = null;
     if (args.name !== undefined) {
@@ -1190,39 +1726,43 @@ class SystemTools {
     const record = this._createProcessRecord(command, {
       persistent: true,
       name,
-      signal: context.signal,
+      signal,
+      env: context.env,
       onOutput: context.onOutput,
     });
-    record._onOutput = context.onOutput;
+    throwIfAborted(signal);
     const snapshot = this._processSnapshot(record, false);
     if (record.error) {
       return this._failure('Process could not be started', new Error(record.error), this._processData(snapshot));
     }
-    if (record.aborted) {
-      return this._failure('Process not started', new Error('Process start was aborted'), this._processData(snapshot));
-    }
+    if (record.aborted) throw createAbortError('Process start was aborted');
     return this._success('Process started', this._processData(snapshot));
   }
 
-  _readProcess(args) {
+  _readProcess(args, context = {}) {
+    throwIfAborted(context.signal);
     const record = this._getProcess(args.id);
     this._flushPendingOutput(record, false);
-    this._flushProcessLog(record);
+    this._flushProcessLog(record, true);
+    throwIfAborted(context.signal);
     return this._success('Process read', this._processData(this._processSnapshot(record, true)));
   }
 
-  async _listProcesses() {
+  async _listProcesses(context = {}) {
+    throwIfAborted(context.signal);
     const processes = [...this.processes.values()]
       .filter((record) => record.persistent)
       .sort((a, b) => a.startedMs - b.startedMs)
       .map((record) => this._processSnapshot(record, false));
     const data = { processes, items: processes, count: processes.length };
-    const taskList = await this._readTaskList();
+    const taskList = await this._readTaskList(context.signal);
+    throwIfAborted(context.signal);
     if (taskList !== undefined) data.taskList = taskList;
     return this._success('Processes listed', data);
   }
 
-  async _readTaskList() {
+  async _readTaskList(signal = null) {
+    throwIfAborted(signal);
     const service = this.services.taskList;
     if (!service) return undefined;
     try {
@@ -1231,7 +1771,8 @@ class SystemTools {
       else if (typeof service === 'function') value = service();
       else if (service && typeof service.list === 'function') value = service.list();
       else return undefined;
-      if (value && typeof value.then === 'function') value = await value;
+      value = await awaitWithAbort(value, signal, 'Process listing aborted');
+      throwIfAborted(signal);
       const rows = Array.isArray(value)
         ? value
         : Array.isArray(value && value.processes)
@@ -1247,26 +1788,37 @@ class SystemTools {
           command: row.command === undefined ? null : redactSecrets(row.command),
         };
       });
-    } catch {
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       return undefined;
     }
   }
 
-  async _stopProcess(args) {
+  async _stopProcess(args, context = {}) {
+    throwIfAborted(context.signal);
     const record = this._getProcess(args.id);
     const force = this._requireBoolean(args.force, 'force', false);
     if (!record._finished) {
       this._terminateChild(record, force);
-      this._scheduleForceFinish(record);
       await record.promise;
     }
+    throwIfAborted(context.signal);
+    const snapshot = this._processSnapshot(record, true);
+    if (!record._finished || snapshot.terminationUnconfirmed || snapshot.closeUnconfirmed) {
+      return this._failure(
+        'Process termination could not be confirmed',
+        new Error(snapshot.error || 'Process-tree termination could not be confirmed'),
+        { ...this._processData(snapshot), stopped: false },
+      );
+    }
     return this._success('Process stopped', {
-      ...this._processData(this._processSnapshot(record, true)),
+      ...this._processData(snapshot),
       stopped: true,
     });
   }
 
   async _execFile(file, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
+    throwIfAborted(signal);
     const options = {
       cwd: this.root,
       shell: false,
@@ -1279,16 +1831,29 @@ class SystemTools {
     };
     if (signal) options.signal = signal;
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let settled = false;
       let timer = null;
       let returned = null;
       let retriedWithoutCallback = false;
 
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (signal && typeof signal.removeEventListener === 'function') {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
       const finish = (error, stdout, stderr, timedOut = false, explicitExitCode = null) => {
         if (settled) return;
+        if (isAbortError(error) || (signal && signal.aborted)) {
+          settled = true;
+          cleanup();
+          reject(isAbortError(error) ? error : createAbortError());
+          return;
+        }
         settled = true;
-        if (timer) clearTimeout(timer);
+        cleanup();
         const numericErrorCode = Number.isInteger(error) ? error : null;
         const errorCode = error && Number.isInteger(error.code) ? error.code : numericErrorCode;
         resolve({
@@ -1301,15 +1866,30 @@ class SystemTools {
           timedOut: Boolean(timedOut || (error && (error.code === 'ETIMEDOUT' || error.killed))),
         });
       };
-
+      const abort = (error = null) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(isAbortError(error) ? error : createAbortError());
+      };
+      const onAbort = () => {
+        if (returned && typeof returned.kill === 'function') {
+          try {
+            returned.kill('SIGTERM');
+          } catch {
+            // The child may have exited between the signal and the kill.
+          }
+        }
+        abort();
+      };
       const callback = (error, stdout, stderr) => finish(error, stdout, stderr);
 
       if (signal && signal.aborted) {
-        const error = new Error('Operation aborted');
-        error.name = 'AbortError';
-        error.code = 'ABORT_ERR';
-        finish(error, '', '');
+        abort();
         return;
+      }
+      if (signal && typeof signal.addEventListener === 'function') {
+        signal.addEventListener('abort', onAbort, { once: true });
       }
 
       const invoke = (withCallback) => {
@@ -1317,6 +1897,10 @@ class SystemTools {
           if (withCallback) return this.services.execFile(file, args, options, callback);
           return this.services.execFile(file, args, options);
         } catch (error) {
+          if (isAbortError(error) || (signal && signal.aborted)) {
+            abort(error);
+            return null;
+          }
           if (withCallback && !retriedWithoutCallback) {
             retriedWithoutCallback = true;
             return invoke(false);
@@ -1391,7 +1975,10 @@ class SystemTools {
   }
 
   async _runGit(args, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null) {
+    throwIfAborted(signal);
     const result = await this._execFile('git', args, { timeoutMs, signal });
+    throwIfAborted(signal);
+    if (isAbortError(result.error)) throw result.error;
     const capped = this._capGitOutput(result.stdout, result.stderr);
     let exitCode = Number.isInteger(result.exitCode) ? result.exitCode : null;
     if (!result.error && exitCode === null) exitCode = 0;
@@ -1408,6 +1995,7 @@ class SystemTools {
   }
 
   _gitFailure(result, label) {
+    if (isAbortError(result.error)) throw result.error;
     const data = {
       exitCode: result.exitCode,
       timedOut: result.timedOut,
@@ -1426,7 +2014,9 @@ class SystemTools {
   }
 
   async _gitStatus(args, context = {}) {
+    throwIfAborted(context.signal);
     const relativePath = this._gitPath(args.path);
+    throwIfAborted(context.signal);
     const result = await this._runGit([
       'status',
       '--short',
@@ -1434,6 +2024,7 @@ class SystemTools {
       '--',
       relativePath,
     ], DEFAULT_TIMEOUT_MS, context.signal);
+    throwIfAborted(context.signal);
     if (!result.ok) return this._gitFailure(result, 'Git status');
     const files = result.stdout.split(/\r?\n/).filter(Boolean).map((line) => ({
       status: line.slice(0, 2),
@@ -1451,6 +2042,7 @@ class SystemTools {
   }
 
   async _gitDiff(args, context = {}) {
+    throwIfAborted(context.signal);
     const relativePath = this._gitPath(args.path);
     const staged = this._requireBoolean(args.staged, 'staged', false);
     const stat = this._requireBoolean(args.stat, 'stat', false);
@@ -1462,6 +2054,7 @@ class SystemTools {
     if (stat) gitArgs.push('--stat');
     gitArgs.push(`--unified=${contextLines}`, '--', relativePath);
     const result = await this._runGit(gitArgs, DEFAULT_TIMEOUT_MS, context.signal);
+    throwIfAborted(context.signal);
     if (!result.ok) return this._gitFailure(result, 'Git diff');
     return this._success('Git diff', {
       path: relativePath,
@@ -1478,6 +2071,7 @@ class SystemTools {
   }
 
   async _gitLog(args, context = {}) {
+    throwIfAborted(context.signal);
     const relativePath = this._gitPath(args.path);
     const limit = args.limit === undefined ? 20 : boundedInteger(args.limit, 20, 1, 1000);
     if (args.query !== undefined) this._requireString(args.query, 'query', { max: 500 });
@@ -1485,6 +2079,7 @@ class SystemTools {
     if (args.query !== undefined) gitArgs.push(`--grep=${args.query}`);
     gitArgs.push('--', relativePath);
     const result = await this._runGit(gitArgs, DEFAULT_TIMEOUT_MS, context.signal);
+    throwIfAborted(context.signal);
     if (!result.ok) return this._gitFailure(result, 'Git log');
     const commits = result.stdout.split(/\r?\n/).filter(Boolean).map((line) => {
       const match = line.match(/^([0-9a-f]+)\s+(.*)$/i);
@@ -1504,6 +2099,7 @@ class SystemTools {
   }
 
   async _gitBlame(args, context = {}) {
+    throwIfAborted(context.signal);
     const relativePath = this._gitPath(args.path);
     if (relativePath === '.') throw new Error('path must identify a file');
     const start = args.startLine === undefined
@@ -1521,6 +2117,7 @@ class SystemTools {
     }
     gitArgs.push('--', relativePath);
     const result = await this._runGit(gitArgs, DEFAULT_TIMEOUT_MS, context.signal);
+    throwIfAborted(context.signal);
     if (!result.ok) return this._gitFailure(result, 'Git blame');
     return this._success('Git blame', {
       path: relativePath,
@@ -1726,8 +2323,10 @@ class SystemTools {
     };
   }
 
-  _listProjectTasks() {
+  _listProjectTasks(context = {}) {
+    throwIfAborted(context.signal);
     const discovered = this._discoverProjectTasks();
+    throwIfAborted(context.signal);
     return this._success('Project tasks detected', {
       tasks: discovered.tasks,
       commands: discovered.tasks.map((task) => task.command),
@@ -1844,8 +2443,10 @@ class SystemTools {
     return task || null;
   }
 
-  async _runDetected(kind, args, context) {
+  async _runDetected(kind, args, context = {}) {
+    throwIfAborted(context.signal);
     const discovered = this._discoverProjectTasks();
+    throwIfAborted(context.signal);
     const allowedByKind = {
       test: ['npm', 'yarn', 'pnpm', 'node', 'pytest', 'tox', 'jest', 'vitest', 'cargo', 'go', 'phpunit', 'make', 'just'],
       lint: ['npm', 'yarn', 'pnpm', 'eslint', 'stylelint', 'ruff', 'flake8', 'pylint', 'mypy', 'phpcs', 'cargo', 'make', 'just'],
@@ -1878,7 +2479,9 @@ class SystemTools {
       coverage,
       kind,
     });
+    throwIfAborted(context.signal);
     const result = await this.execute('run_command', { command }, context);
+    throwIfAborted(context.signal);
     if (!isObject(result.data)) result.data = {};
     result.data.runner = {
       name: runner.name,
@@ -1945,15 +2548,26 @@ class SystemTools {
     return path.join(this.logDir, 'memory.json');
   }
 
-  _readMemory() {
+  _readMemory(signal = null) {
+    throwIfAborted(signal);
     const memoryPath = this._memoryPath();
     if (!fs.existsSync(memoryPath) && !this._isLink(memoryPath)) return Object.create(null);
     if (this._isLink(memoryPath)) throw new Error('Memory file must not be a symlink');
-    const real = this._realpathIfPresent(memoryPath);
-    if (real && !this._pathIsWithin(fs.realpathSync.native ? fs.realpathSync.native(this.logDir) : this.logDir, real)) {
+    const logReal = this._realpathIfPresent(this.logDir);
+    if (!logReal) throw new Error('Log directory could not be resolved safely');
+    let real;
+    try {
+      real = this._realpath(memoryPath);
+    } catch {
+      throw new Error('Memory file could not be resolved safely');
+    }
+    if (!this._pathIsWithin(logReal, real)) {
       throw new Error('Memory file is outside the log directory');
     }
-    const text = fs.readFileSync(memoryPath, 'utf8');
+    const stat = fs.statSync(real);
+    if (stat.size > MAX_MEMORY_BYTES) return Object.create(null);
+    const text = fs.readFileSync(real, 'utf8');
+    throwIfAborted(signal);
     const parsed = readJson(text);
     if (!isObject(parsed)) return Object.create(null);
     const result = Object.create(null);
@@ -1963,23 +2577,38 @@ class SystemTools {
     return result;
   }
 
-  _writeMemory(memory) {
+  _writeMemory(memory, signal = null) {
+    throwIfAborted(signal);
     const memoryPath = this._memoryPath();
     const temporary = path.join(this.logDir, `.memory-${randomToken()}.tmp`);
     const serialized = `${JSON.stringify(memory, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_MEMORY_BYTES) {
+      throw new Error('Memory data exceeds the retention limit');
+    }
     try {
-      fs.writeFileSync(temporary, serialized, { encoding: 'utf8', mode: 0o600 });
+      // wx prevents an unexpected pre-created temp symlink/file from being
+      // followed. The signal is checked again immediately before the commit.
+      fs.writeFileSync(temporary, serialized, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      throwIfAborted(signal);
       try {
         fs.renameSync(temporary, memoryPath);
       } catch (error) {
         if (!['EEXIST', 'EPERM', 'EACCES'].includes(error && error.code)) throw error;
-        fs.writeFileSync(memoryPath, serialized, { encoding: 'utf8', mode: 0o600 });
+        throwIfAborted(signal);
+        if (this._isLink(memoryPath)) throw new Error('Memory file must not be a symlink');
+        const constants = fs.constants || {};
+        const flags = (constants.O_WRONLY || 1)
+          | (constants.O_CREAT || 0)
+          | (constants.O_TRUNC || 0)
+          | (constants.O_NOFOLLOW || 0);
+        const fd = fs.openSync(memoryPath, flags, 0o600);
         try {
-          fs.unlinkSync(temporary);
-        } catch {
-          // Best effort cleanup.
+          fs.writeFileSync(fd, serialized, { encoding: 'utf8' });
+        } finally {
+          fs.closeSync(fd);
         }
       }
+      throwIfAborted(signal);
     } finally {
       try {
         if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
@@ -1989,7 +2618,9 @@ class SystemTools {
     }
   }
 
-  _projectMemory(args) {
+  _projectMemory(args, context = {}) {
+    const signal = context.signal;
+    throwIfAborted(signal);
     const action = this._requireString(args.action, 'action', { max: 20 });
     if (!['remember', 'recall', 'forget'].includes(action)) throw new Error('Unsupported memory action');
     const key = this._requireString(args.key, 'key', { max: 80 });
@@ -1999,13 +2630,16 @@ class SystemTools {
     if (action === 'remember') {
       if (typeof args.value !== 'string') throw new Error('value must be a string');
       if (args.value.length > 4000) throw new Error('value is too long');
-      const memory = this._readMemory();
+      const memory = this._readMemory(signal);
+      throwIfAborted(signal);
       memory[key] = args.value;
-      this._writeMemory(memory);
+      this._writeMemory(memory, signal);
+      throwIfAborted(signal);
       return this._success('Memory remembered', { key, value: args.value });
     }
 
-    const memory = this._readMemory();
+    const memory = this._readMemory(signal);
+    throwIfAborted(signal);
     if (action === 'recall') {
       const value = Object.prototype.hasOwnProperty.call(memory, key) ? memory[key] : null;
       return this._success('Memory recalled', { key, value, found: value !== null });
@@ -2014,16 +2648,39 @@ class SystemTools {
     const existed = Object.prototype.hasOwnProperty.call(memory, key);
     if (existed) {
       delete memory[key];
-      this._writeMemory(memory);
+      this._writeMemory(memory, signal);
+      throwIfAborted(signal);
     }
     return this._success('Memory forgotten', { key, removed: existed });
   }
 
-  async _openPath(args) {
+  async _openPath(args, context = {}) {
+    const signal = context.signal;
+    throwIfAborted(signal);
     const reveal = this._requireBoolean(args.reveal, 'reveal', false);
-    const resolved = this._resolveWorkspacePath(args.path, { mustExist: true });
-    const actualPath = resolved.real || resolved.absolute;
-    const relative = resolved.relative;
+    let resolved = this._resolveWorkspacePath(args.path, { mustExist: true });
+    throwIfAborted(signal);
+    let actualPath = resolved.real || resolved.absolute;
+    let relative = resolved.relative;
+
+    // Re-resolve immediately before producing a suggestion or invoking the
+    // desktop callback. This closes the common symlink/replacement window in
+    // which a path was safe during argument validation but points elsewhere by
+    // the time it is opened.
+    const revalidated = this._resolveWorkspacePath(args.path, { mustExist: true });
+    if (this._canonicalPathKey(revalidated.real) !== this._canonicalPathKey(actualPath)) {
+      throw new Error('Path changed while it was being opened');
+    }
+    resolved = revalidated;
+    actualPath = resolved.real;
+    relative = resolved.relative;
+    try {
+      fs.statSync(actualPath);
+    } catch {
+      throw new Error('Path does not exist');
+    }
+    throwIfAborted(signal);
+
     if (this.platform === 'win32' && /[%!^"&|<>]/.test(actualPath)) {
       throw new Error('Path cannot be represented safely in a shell suggestion');
     }
@@ -2042,12 +2699,24 @@ class SystemTools {
     let opened = false;
     if (typeof callback === 'function') {
       try {
-        const callbackResult = await callback(actualPath, { reveal, workspaceRelativePath: relative });
+        throwIfAborted(signal);
+        const callbackResult = await awaitWithAbort(
+          callback(actualPath, { reveal, workspaceRelativePath: relative }),
+          signal,
+          'Open path callback aborted',
+        );
+        throwIfAborted(signal);
+        const after = this._resolveWorkspacePath(args.path, { mustExist: true });
+        if (this._canonicalPathKey(after.real) !== this._canonicalPathKey(actualPath)) {
+          throw new Error('Path changed while it was being opened');
+        }
         if (callbackResult === false || (typeof callbackResult === 'string' && callbackResult.trim())) {
           throw new Error(typeof callbackResult === 'string' ? callbackResult : 'Open path callback failed');
         }
         opened = true;
       } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (signal && signal.aborted) throw createAbortError();
         return this._failure('Open path callback failed', error, {
           path: relative,
           absolutePath: actualPath,
@@ -2057,12 +2726,14 @@ class SystemTools {
         });
       }
     }
+    throwIfAborted(signal);
     return this._success('Open path prepared', {
       path: relative,
       absolutePath: actualPath,
       reveal,
       suggestion,
       opened,
+      canonical: true,
     });
   }
 
@@ -2070,10 +2741,12 @@ class SystemTools {
     const active = [...this.processes.values()].filter((record) => !record._finished);
     for (const record of active) {
       this._terminateChild(record, true);
-      this._scheduleForceFinish(record);
     }
     await Promise.all(active.map((record) => record.promise));
-    return { stopped: active.length, remaining: [...this.processes.values()].filter((record) => !record._finished).length };
+    return {
+      stopped: active.filter((record) => record._finished).length,
+      remaining: [...this.processes.values()].filter((record) => !record._finished).length,
+    };
   }
 }
 

@@ -12,18 +12,63 @@
     workspace: '',
     lmBaseUrl: 'http://127.0.0.1:1234/v1',
     model: '',
+    modelPreset: 'qwen3-4b-1050ti',
     temperature: 0.2,
-    maxSteps: 12,
-    contextChars: 24000,
-    maxSubagents: 3,
-    concurrentSubagents: 2,
+    maxTokens: 2048,
+    contextLength: 2048,
+    maxSteps: 8,
+    contextChars: 8000,
+    maxSubagents: 1,
+    concurrentSubagents: 1,
+    maxSubagentSteps: 6,
+    flashAttention: true,
     approvalMode: 'automatic',
-    allowFallbackTools: true,
+    allowFallbackTools: false,
     braveApiKey: '',
     ddgFallback: true,
     mcpServers: '{}',
     braveApiKeyPresent: false,
     theme: 'dark'
+  };
+
+  var MODEL_PRESETS = {
+    'qwen3-4b-1050ti': {
+      label: 'Qwen3 4B — GTX 1050 Ti 4GB',
+      model: 'qwen3-4b-instruct-2507',
+      contextLength: 2048,
+      maxTokens: 2048,
+      contextChars: 8000,
+      maxSteps: 8,
+      maxSubagents: 1,
+      concurrentSubagents: 1,
+      maxSubagentSteps: 6,
+      flashAttention: true
+    },
+    'qwen25-coder-3b': {
+      label: 'Qwen2.5 Coder 3B — nhẹ, ổn định',
+      model: 'qwen2.5-coder-3b-instruct',
+      contextLength: 4096,
+      maxTokens: 2048,
+      contextChars: 10000,
+      maxSteps: 8,
+      maxSubagents: 1,
+      concurrentSubagents: 1,
+      maxSubagentSteps: 6,
+      flashAttention: true
+    },
+    'qwen25-coder-14b': {
+      label: 'Qwen2.5 Coder 14B — chất lượng, chậm hơn',
+      model: 'qwen2.5-coder-14b-instruct',
+      contextLength: 4096,
+      maxTokens: 2048,
+      contextChars: 10000,
+      maxSteps: 6,
+      maxSubagents: 0,
+      concurrentSubagents: 1,
+      maxSubagentSteps: 4,
+      flashAttention: true
+    },
+    custom: { label: 'Tùy chỉnh', model: '', contextLength: 2048, maxTokens: 2048, contextChars: 8000, maxSteps: 8, maxSubagents: 1, concurrentSubagents: 1, maxSubagentSteps: 6, flashAttention: true }
   };
 
   var MODES = {
@@ -133,8 +178,8 @@
     'onboarding-workspace-path', 'onboarding-workspace-pick', 'onboarding-back-btn',
     'onboarding-continue', 'settings-modal', 'settings-close', 'settings-workspace',
     'settings-workspace-pick', 'settings-workspace-clear', 'settings-theme', 'settings-language',
-    'settings-lm-url', 'settings-model', 'settings-refresh-models', 'settings-model-hint',
-    'settings-temperature', 'settings-context-chars', 'settings-connection-dot',
+    'settings-lm-url', 'settings-model', 'settings-model-preset', 'settings-model-preset-hint', 'settings-refresh-models', 'settings-load-model', 'settings-model-hint',
+    'settings-temperature', 'settings-max-tokens', 'settings-context-length', 'settings-flash-attention', 'settings-context-chars', 'settings-connection-dot',
     'settings-connection-title', 'settings-connection-detail', 'settings-test-btn', 'settings-max-steps',
     'settings-approval-mode', 'settings-max-subagents', 'settings-concurrent-subagents', 'settings-allow-fallback-tools',
     'settings-brave-key', 'settings-ddg-fallback', 'settings-mcp-json', 'mcp-status-text',
@@ -339,17 +384,24 @@
     var webProvider = stringOr(field(source, ['webProvider', 'searchProvider'], ''), '').toLowerCase();
     var fallbackValue = field(source, ['ddgFallback', 'duckDuckGoFallback'], undefined);
     var themeFallback = state.settings && state.settings.theme ? state.settings.theme : readStorage(STORAGE.theme, DEFAULT_SETTINGS.theme);
+    var modelPreset = stringOr(field(source, ['modelPreset', 'modelProfile'], DEFAULT_SETTINGS.modelPreset), DEFAULT_SETTINGS.modelPreset);
+    if (!MODEL_PRESETS[modelPreset]) modelPreset = 'custom';
     return {
       workspace: stringOr(field(source, ['workspace', 'workspacePath', 'folder', 'fileRoot'], DEFAULT_SETTINGS.workspace), DEFAULT_SETTINGS.workspace),
       lmBaseUrl: stringOr(field(source, ['lmBaseUrl', 'baseUrl', 'lmUrl', 'lmStudioUrl'], DEFAULT_SETTINGS.lmBaseUrl), DEFAULT_SETTINGS.lmBaseUrl),
       model: stringOr(field(source, ['model', 'modelId', 'lmModel'], DEFAULT_SETTINGS.model), DEFAULT_SETTINGS.model),
+      modelPreset: modelPreset,
       temperature: numberOr(field(source, ['temperature'], DEFAULT_SETTINGS.temperature), DEFAULT_SETTINGS.temperature, 0, 2),
+      maxTokens: numberOr(field(source, ['maxTokens', 'maxOutputTokens'], DEFAULT_SETTINGS.maxTokens), DEFAULT_SETTINGS.maxTokens, 256, 8192),
+      contextLength: numberOr(field(source, ['contextLength', 'lmContextLength'], DEFAULT_SETTINGS.contextLength), DEFAULT_SETTINGS.contextLength, 512, 32768),
       maxSteps: numberOr(field(source, ['maxSteps', 'agentMaxSteps'], DEFAULT_SETTINGS.maxSteps), DEFAULT_SETTINGS.maxSteps, 1, 100),
-      contextChars: numberOr(field(source, ['contextChars', 'maxContextChars', 'contextLength'], DEFAULT_SETTINGS.contextChars), DEFAULT_SETTINGS.contextChars, 1000, 2000000),
+      contextChars: numberOr(field(source, ['contextChars', 'maxContextChars'], DEFAULT_SETTINGS.contextChars), DEFAULT_SETTINGS.contextChars, 1000, 2000000),
       maxSubagents: numberOr(field(source, ['maxSubagents', 'subagentsMax'], DEFAULT_SETTINGS.maxSubagents), DEFAULT_SETTINGS.maxSubagents, 0, 16),
       concurrentSubagents: numberOr(field(source, ['concurrentSubagents', 'maxConcurrentSubagents', 'parallelSubagents'], DEFAULT_SETTINGS.concurrentSubagents), DEFAULT_SETTINGS.concurrentSubagents, 1, 8),
+      maxSubagentSteps: numberOr(field(source, ['maxSubagentSteps'], DEFAULT_SETTINGS.maxSubagentSteps), DEFAULT_SETTINGS.maxSubagentSteps, 1, 100),
+      flashAttention: field(source, ['flashAttention'], DEFAULT_SETTINGS.flashAttention) === true,
       approvalMode: stringOr(field(source, ['approvalMode', 'approval'], DEFAULT_SETTINGS.approvalMode), DEFAULT_SETTINGS.approvalMode),
-      allowFallbackTools: field(source, ['allowFallbackTools'], DEFAULT_SETTINGS.allowFallbackTools) !== false,
+      allowFallbackTools: field(source, ['allowFallbackTools'], DEFAULT_SETTINGS.allowFallbackTools) === true,
       braveApiKey: secret,
       braveApiKeyPresent: Boolean(field(source, ['braveApiKeyPresent', 'hasBraveApiKey'], Boolean(secret))),
       ddgFallback: fallbackValue === undefined ? (!webProvider || webProvider === 'duckduckgo') : Boolean(fallbackValue),
@@ -364,12 +416,17 @@
       fileRoot: settings.workspace,
       lmBaseUrl: settings.lmBaseUrl,
       model: settings.model,
+      modelPreset: settings.modelPreset,
       temperature: settings.temperature,
+      maxTokens: settings.maxTokens,
+      contextLength: settings.contextLength,
       maxSteps: settings.maxSteps,
       contextChars: settings.contextChars,
       maxSubagents: settings.maxSubagents,
       concurrentSubagents: settings.concurrentSubagents,
       maxConcurrentSubagents: settings.concurrentSubagents,
+      maxSubagentSteps: settings.maxSubagentSteps,
+      flashAttention: settings.flashAttention !== false,
       approvalMode: settings.approvalMode,
       allowFallbackTools: settings.allowFallbackTools !== false,
       braveApiKey: settings.braveApiKey,
@@ -538,7 +595,7 @@
       id: id,
       title: stringOr(field(source, ['title', 'name'], ''), '') || deriveTitle(messages),
       messages: messages,
-      preview: derivePreview(messages),
+      preview: stringOr(field(source, ['preview'], ''), '') || derivePreview(messages),
       workspace: workspace.path,
       workspaceName: workspace.name,
       mode: normalizeMode(field(source, ['mode'], 'chat')),
@@ -1435,13 +1492,14 @@
       dom['message-input'].value = '';
       resizeComposer();
       addMessage(userMessage, { dedupe: true });
-      ensureStreamMessage(sessionId, 'assistant-' + Date.now());
+      var assistantId = 'assistant-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+      ensureStreamMessage(sessionId, assistantId);
       state.runId = null;
       state.activityError = false;
       streamMessageId = state.messages[state.messages.length - 1] ? state.messages[state.messages.length - 1].id : streamMessageId;
       setRunning(true);
       addActivity('stage', { title: 'Bắt đầu lượt làm việc', detail: MODES[state.mode].label + ' · đang chuẩn bị ngữ cảnh', status: 'running' });
-      var sendPayload = { sessionId: sessionId, text: text, mode: state.mode };
+      var sendPayload = { sessionId: sessionId, text: text, mode: state.mode, clientMessageId: userId, clientAssistantMessageId: assistantId };
       if (attachments.length) sendPayload.attachments = attachments;
       var result = await bridgeCall('sendMessage', sendPayload);
       if (result && result.ok === false) throw new Error(field(result, ['error', 'message'], 'Tác nhân chưa thể bắt đầu.'));
@@ -1465,8 +1523,14 @@
     }
   }
 
+  function clearInteractionUi() {
+    if (state.pendingAsk) { state.pendingAsk = null; closeModal('ask-user-modal'); }
+    if (state.pendingApproval) { state.pendingApproval = null; closeModal('approval-modal'); }
+  }
+
   function finishRun(event) {
     var payload = event || {};
+    clearInteractionUi();
     setStreamComplete(payload);
     setRunning(false);
     state.runId = null;
@@ -1497,6 +1561,7 @@
 
   function failRun(event) {
     var payload = event || {};
+    clearInteractionUi();
     var errorText = safeError(field(payload, ['error', 'message', 'detail'], ''), 'Tác nhân gặp lỗi.');
     if (streamMessageId) {
       var stream = state.messages.find(function (message) { return message.id === streamMessageId; });
@@ -1896,15 +1961,62 @@
     showToast('Thiết lập hoàn tất', 'Chào mừng bạn đến với CodePilot.');
   }
 
+  function modelForPreset(presetId) {
+    var preset = MODEL_PRESETS[presetId];
+    if (!preset || presetId === 'custom') return '';
+    var models = state.lmStatus && Array.isArray(state.lmStatus.models) ? state.lmStatus.models : [];
+    var terms = presetId === 'qwen3-4b-1050ti'
+      ? ['qwen3', '4b']
+      : presetId === 'qwen25-coder-3b'
+        ? ['qwen2.5-coder', '3b']
+        : ['qwen2.5-coder', '14b'];
+    var match = models.find(function (item) {
+      var value = (String(item.id || '') + ' ' + String(item.name || '') + ' ' + String(item.displayName || '')).toLowerCase();
+      return terms.every(function (term) { return value.includes(term); });
+    });
+    return match ? String(match.id || '') : preset.model;
+  }
+
+  function applyModelPreset(presetId) {
+    var preset = MODEL_PRESETS[presetId];
+    if (!preset) return;
+    if (dom['settings-model-preset']) dom['settings-model-preset'].value = presetId;
+    if (dom['settings-model-preset-hint']) {
+      dom['settings-model-preset-hint'].textContent = presetId === 'custom'
+        ? 'Đang dùng cấu hình tùy chỉnh; app không tự tải model.'
+        : 'Preset chỉ điền cấu hình; app không tự tải model.';
+    }
+    if (presetId === 'custom') return;
+    if (dom['settings-model']) dom['settings-model'].value = modelForPreset(presetId);
+    if (dom['settings-max-tokens']) dom['settings-max-tokens'].value = preset.maxTokens;
+    if (dom['settings-context-length']) dom['settings-context-length'].value = preset.contextLength;
+    if (dom['settings-context-chars']) dom['settings-context-chars'].value = preset.contextChars;
+    if (dom['settings-max-steps']) dom['settings-max-steps'].value = preset.maxSteps;
+    if (dom['settings-max-subagents']) dom['settings-max-subagents'].value = preset.maxSubagents;
+    if (dom['settings-concurrent-subagents']) dom['settings-concurrent-subagents'].value = preset.concurrentSubagents;
+    if (dom['settings-flash-attention']) dom['settings-flash-attention'].checked = preset.flashAttention;
+  }
+
+  function markModelPresetCustom() {
+    if (dom['settings-model-preset'] && dom['settings-model-preset'].value !== 'custom') {
+      dom['settings-model-preset'].value = 'custom';
+      if (dom['settings-model-preset-hint']) dom['settings-model-preset-hint'].textContent = 'Đang dùng cấu hình tùy chỉnh; app không tự tải model.';
+    }
+  }
+
   function populateSettingsForm() {
     var settings = state.settings;
     if (!dom['settings-workspace']) return;
     dom['settings-workspace'].value = settings.workspace || '';
     dom['settings-theme'].value = settings.theme || 'dark';
     dom['settings-lm-url'].value = settings.lmBaseUrl || DEFAULT_SETTINGS.lmBaseUrl;
+    dom['settings-model-preset'].value = MODEL_PRESETS[settings.modelPreset] ? settings.modelPreset : 'custom';
     dom['settings-model'].value = settings.model || '';
     dom['settings-temperature'].value = settings.temperature;
+    dom['settings-max-tokens'].value = settings.maxTokens;
+    dom['settings-context-length'].value = settings.contextLength;
     dom['settings-context-chars'].value = settings.contextChars;
+    dom['settings-flash-attention'].checked = settings.flashAttention !== false;
     dom['settings-max-steps'].value = settings.maxSteps;
     dom['settings-approval-mode'].value = settings.approvalMode;
     dom['settings-max-subagents'].value = settings.maxSubagents;
@@ -1931,13 +2043,18 @@
     return {
       workspace: dom['settings-workspace'].value.trim(),
       lmBaseUrl: dom['settings-lm-url'].value.trim() || DEFAULT_SETTINGS.lmBaseUrl,
+      modelPreset: dom['settings-model-preset'].value,
       model: dom['settings-model'].value.trim(),
       temperature: numberOr(dom['settings-temperature'].value, DEFAULT_SETTINGS.temperature, 0, 2),
+      maxTokens: numberOr(dom['settings-max-tokens'].value, DEFAULT_SETTINGS.maxTokens, 256, 8192),
+      contextLength: numberOr(dom['settings-context-length'].value, DEFAULT_SETTINGS.contextLength, 512, 32768),
       contextChars: numberOr(dom['settings-context-chars'].value, DEFAULT_SETTINGS.contextChars, 1000, 2000000),
       maxSteps: numberOr(dom['settings-max-steps'].value, DEFAULT_SETTINGS.maxSteps, 1, 100),
       approvalMode: dom['settings-approval-mode'].value,
       maxSubagents: maxSubagents,
       concurrentSubagents: concurrentSubagents,
+      maxSubagentSteps: numberOr(state.settings.maxSubagentSteps, DEFAULT_SETTINGS.maxSubagentSteps, 1, 100),
+      flashAttention: dom['settings-flash-attention'].checked,
       allowFallbackTools: dom['settings-allow-fallback-tools'].checked,
       braveApiKey: brave || state.settings.braveApiKey,
       braveApiKeyPresent: Boolean(state.settings.braveApiKeyPresent || state.settings.braveApiKey || brave),
@@ -1993,6 +2110,29 @@
     state.settings = Object.assign({}, DEFAULT_SETTINGS, { workspace: state.workspace || '' });
     populateSettingsForm();
     showToast('Đã đặt lại biểu mẫu', 'Nhớ lưu để áp dụng giá trị mặc định.', 'warning');
+  }
+
+  async function loadConfiguredModel() {
+    var values = collectSettingsForm();
+    if (!values || !values.model) {
+      showToast('Chưa có model', 'Chọn hoặc nhập ID model trước khi load.', 'warning');
+      return;
+    }
+    var button = dom['settings-load-model'];
+    if (button) button.disabled = true;
+    try {
+      var saved = await bridgeCall('updateSettings', settingsPatch(values));
+      var returned = saved && saved.settings ? saved.settings : saved;
+      state.settings = normalizeSettings(Object.assign({}, state.settings, values, returned || {}));
+      populateSettingsForm();
+      var result = await bridgeCall('loadModel', values.model);
+      applyLmStatus(result && result.status ? result.status : result);
+      showToast('Đang load model', values.model + ' · context ' + values.contextLength + ' token.');
+    } catch (error) {
+      showToast('Không thể load model', safeError(error, 'Kiểm tra LM Studio và ID model.'), 'error');
+    } finally {
+      if (button) button.disabled = false;
+    }
   }
 
   async function testSettingsConnection() {
@@ -2116,6 +2256,7 @@
     setText(dom['approval-tool-name'], humanizeTool(state.pendingApproval.tool));
     var args = field(event, ['args', 'arguments', 'input', 'parameters'], '');
     var summary = summarizeValue(args) || 'Không có tham số.';
+    if (field(event, ['argumentsTruncated'], false)) summary += ' · tham số dài đã được rút gọn';
     setText(dom['approval-tool-args'], summary);
     setHidden(dom['approval-error'], true);
     openModal('approval-modal', '#approval-approve');
@@ -2182,6 +2323,19 @@
           var created = normalizeSession(unwrap(event, 'session') || event, state.sessions.length);
           updateSessionInList(created);
           if (!state.activeSessionId || event.select !== false) setActiveSession(created);
+          renderSessions();
+          break;
+        }
+        case 'session-deleted': {
+          var deletedId = stringOr(field(event, ['id', 'sessionId'], ''), '');
+          state.sessions = state.sessions.filter(function (session) { return session.id !== deletedId; });
+          if (state.activeSessionId === deletedId) {
+            state.activeSessionId = null;
+            state.activeSession = null;
+            state.messages = [];
+            writeStorage(STORAGE.activeSession, '');
+            setChatView();
+          }
           renderSessions();
           break;
         }
@@ -2443,9 +2597,16 @@
     dom['settings-close'].addEventListener('click', function () { closeModal('settings-modal'); });
     dom['settings-cancel-btn'].addEventListener('click', function () { closeModal('settings-modal'); });
     dom['settings-save-btn'].addEventListener('click', saveSettings);
+    dom['settings-model-preset'].addEventListener('change', function () { applyModelPreset(dom['settings-model-preset'].value); });
+    ['settings-model', 'settings-max-tokens', 'settings-context-length', 'settings-context-chars', 'settings-temperature', 'settings-max-steps', 'settings-max-subagents', 'settings-concurrent-subagents', 'settings-flash-attention'].forEach(function (id) {
+      var input = dom[id];
+      if (input) input.addEventListener('input', markModelPresetCustom);
+      if (input) input.addEventListener('change', markModelPresetCustom);
+    });
     dom['settings-reset-btn'].addEventListener('click', resetSettingsForm);
     dom['settings-test-btn'].addEventListener('click', testSettingsConnection);
     dom['settings-refresh-models'].addEventListener('click', refreshSettingsModels);
+    dom['settings-load-model'].addEventListener('click', loadConfiguredModel);
     dom['settings-workspace-pick'].addEventListener('click', chooseWorkspace);
     dom['settings-workspace-clear'].addEventListener('click', function () {
       state.settings.workspace = '';
@@ -2587,7 +2748,12 @@
       'settings-workspace': 'Thư mục mà tác nhân được phép đọc và thay đổi.',
       'settings-lm-url': 'API tương thích OpenAI của LM Studio. Mặc định là http://127.0.0.1:1234/v1.',
       'settings-model': 'ID mô hình đang được LM Studio nạp.',
+      'settings-load-model': 'Lưu preset rồi yêu cầu LM Studio load model với context đã chọn.',
+      'settings-model-preset': 'Chỉ điền cấu hình model; ứng dụng không tự tải.',
       'settings-temperature': 'Số cao hơn tạo câu trả lời sáng tạo hơn nhưng có thể kém ổn định hơn.',
+      'settings-max-tokens': 'Giới hạn số token model được sinh trong một lượt.',
+      'settings-context-length': 'Context được gửi khi Load model trong LM Studio.',
+      'settings-flash-attention': 'Tối ưu bộ nhớ khi LM Studio hỗ trợ.',
       'settings-context-chars': 'Ước lượng số ký tự ngữ cảnh được phép đưa vào một lượt.',
       'settings-max-steps': 'Giới hạn số bước suy nghĩ, đọc tệp và kiểm thử trong một lượt.',
       'settings-approval-mode': 'Chọn khi nào tác nhân phải hỏi bạn trước thao tác nhạy cảm.',
