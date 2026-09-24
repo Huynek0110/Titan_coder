@@ -53,6 +53,7 @@ test('defaults and settings sanitization are stable', () => {
 
   const updated = updateSettings(DEFAULT_SETTINGS, { model: 'local', fileRoot: '' });
   assert.equal(updated.model, 'local');
+  assert.doesNotThrow(() => updateSettings(DEFAULT_SETTINGS, { lmBaseUrl: 'http://127.0.0.1:1234/v1' }));
   assert.equal(DEFAULT_SETTINGS.model, '');
 
   const tuned = updateSettings(DEFAULT_SETTINGS, {

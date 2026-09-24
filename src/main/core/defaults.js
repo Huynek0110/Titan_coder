@@ -358,8 +358,9 @@ function invalid(message) {
 function assertUrl(value) {
   if (typeof value !== 'string' || value.length > SAFE_LIMITS.urlChars) throw invalid('lmBaseUrl must be a URL string');
   const text = value.trim();
+  let parsed;
   try {
-    const parsed = new URL(text);
+    parsed = new URL(text);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('protocol');
     if (parsed.username || parsed.password) throw new Error('credentials');
   } catch {

@@ -128,6 +128,14 @@ async function withDeadline(promise, milliseconds, label) {
     if (!details || !String(details.title || '').startsWith('CodePilot') || !details.hasApi || details.ready !== 'complete') {
       throw new Error(`Unexpected renderer: ${JSON.stringify(details)}\n${logs}`);
     }
+    const settingsProbe = await cdp.call('Runtime.evaluate', {
+      expression: `window.codepilot.updateSettings({workspace:'',fileRoot:'',lmBaseUrl:'http://127.0.0.1:1234/v1',modelPreset:'qwen3-4b-1050ti',model:'qwen3-4b-instruct-2507',temperature:0.2,maxTokens:2048,contextLength:2048,contextChars:8000,maxSteps:8,maxSubagents:1,concurrentSubagents:1,maxConcurrentSubagents:1,maxSubagentSteps:6,flashAttention:true,approvalMode:'automatic',allowFallbackTools:false,braveApiKey:'',ddgFallback:true,webProvider:'duckduckgo',mcpServers:{},theme:'dark'}).then((value) => JSON.stringify({ok: Boolean(value), model: value?.model, contextLength: value?.contextLength})).catch((error) => JSON.stringify({error: String(error?.message || error)}))`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    const settingsProbeValue = settingsProbe?.result?.value ? JSON.parse(settingsProbe.result.value) : {};
+    if (settingsProbeValue.error) throw new Error(`Settings update probe failed: ${settingsProbeValue.error}\n${logs}`);
+
     try {
       const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, 15_000);
       if (screenshot?.data) {
