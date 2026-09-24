@@ -1571,7 +1571,6 @@ class SystemTools {
       snapshot.output = logs.combined;
     }
     if (record.error) snapshot.error = redactSecrets(record.error);
-    if (record._terminationMessage && !record.error) snapshot.error = redactSecrets(record._terminationMessage);
     if (record.logError) snapshot.logError = redactSecrets(record.logError);
     return snapshot;
   }
@@ -1687,9 +1686,9 @@ class SystemTools {
     };
 
     if (result.aborted) throw createAbortError('Command aborted');
-    if (result.terminationUnconfirmed || result.closeUnconfirmed) {
+    if (result.status === 'terminationUnconfirmed' || result.status === 'closeUnconfirmed') {
       return this._failure(
-        result.terminationUnconfirmed ? 'Command termination could not be confirmed' : 'Command close could not be confirmed',
+        result.status === 'terminationUnconfirmed' ? 'Command termination could not be confirmed' : 'Command close could not be confirmed',
         new Error(result.error || 'Process close could not be confirmed'),
         data,
       );
@@ -1800,7 +1799,7 @@ class SystemTools {
     }
     throwIfAborted(context.signal);
     const snapshot = this._processSnapshot(record, true);
-    if (!record._finished || snapshot.terminationUnconfirmed || snapshot.closeUnconfirmed) {
+    if (!record._finished || snapshot.status === 'terminationUnconfirmed' || snapshot.status === 'closeUnconfirmed') {
       return this._failure(
         'Process termination could not be confirmed',
         new Error(snapshot.error || 'Process-tree termination could not be confirmed'),
