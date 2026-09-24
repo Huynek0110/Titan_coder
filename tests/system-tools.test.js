@@ -46,6 +46,11 @@ test('exports all focused tools and makes plan definitions read-only/no-shell', 
     const tools = new SystemTools({ root, logDir: path.join(root, 'logs') });
     const definitions = tools.definitions();
     assert.equal(definitions.length, TOOL_NAMES.length);
+    const commandDefinition = definitions.find((definition) => definition.function.name === 'run_command');
+    assert.equal(commandDefinition.metadata.command, true);
+    assert.equal(commandDefinition.metadata.shell, true);
+    assert.equal(commandDefinition.metadata.mutating, true);
+    assert.equal(commandDefinition.metadata.requiresApproval, true);
     assert.deepEqual(
       definitions.map((definition) => definition.function.name).sort(),
       [...TOOL_NAMES].sort(),
@@ -353,7 +358,7 @@ test('Windows process control uses taskkill for the complete process tree', asyn
     assert.deepEqual(taskkill.args, ['/PID', String(primary.pid), '/T', '/F']);
     assert.equal(taskkill.options.shell, false);
     assert.equal(taskkill.options.detached, false);
-    assert.equal(stopped.data.process.terminationConfirmed, true);
+    assert.equal(stopped.data.process.status, 'exited');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -377,7 +382,7 @@ test('an unconfirmed process-tree stop is reported without claiming completion',
     assert.equal(stopped.ok, false);
     assert.equal(stopped.data.stopped, false);
     assert.equal(stopped.data.process.status, 'terminationUnconfirmed');
-    assert.equal(stopped.data.process.terminationConfirmed, false);
+    assert.match(stopped.error, /termination|confirm/i);
     assert.ok(primary);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

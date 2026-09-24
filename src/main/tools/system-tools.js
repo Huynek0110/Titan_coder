@@ -1562,10 +1562,6 @@ class SystemTools {
       timedOut: Boolean(record.timedOut),
       aborted: Boolean(record.aborted),
       killed: Boolean(record.killed),
-      terminationRequested: Boolean(record._terminationRequested),
-      terminationConfirmed: Boolean(record._treeKillConfirmed),
-      terminationUnconfirmed: Boolean(record.terminationUnconfirmed),
-      closeUnconfirmed: Boolean(record.closeUnconfirmed),
       truncated: Boolean(logs.truncated),
       logPath: record.logPath,
     };
@@ -2733,7 +2729,6 @@ class SystemTools {
       reveal,
       suggestion,
       opened,
-      canonical: true,
     });
   }
 
