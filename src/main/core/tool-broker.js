@@ -238,6 +238,12 @@ function eventResult(envelope) {
   return result;
 }
 
+function modelDefinition(definition) {
+  if (!definition || !Object.prototype.hasOwnProperty.call(definition, 'metadata')) return definition;
+  const { metadata: _internalMetadata, ...publicDefinition } = definition;
+  return publicDefinition;
+}
+
 function abortError(message = 'Tool execution was aborted.') {
   const error = new Error(message);
   error.name = 'AbortError';
@@ -374,7 +380,7 @@ class ToolBroker {
         if (!name || seen.has(name)) continue;
         if (selectedMode === 'plan' && (isMutatingTool(name, definition) || isMcpTool(name, definition))) continue;
         seen.add(name);
-        definitions.push(definition);
+        definitions.push(modelDefinition(definition));
       }
     }
     return definitions;
@@ -422,7 +428,7 @@ class ToolBroker {
       if (selectedMode === 'plan' && (isMutatingTool(name, definition) || isMcpTool(name, definition))) return;
       if (options.subagent && (isMutatingTool(name, definition) || isMcpTool(name, definition))) return;
       if (selected.length >= maxTools + (options.includeMcp ? 3 : 0)) return;
-      selected.push(definition);
+      selected.push(modelDefinition(definition));
       seen.add(name);
     };
     for (const name of preferred) add(byName.get(name));
@@ -578,4 +584,5 @@ module.exports = {
   MAX_RESULT_CHARS,
   safeEventText,
   eventResult,
+  modelDefinition,
 };
