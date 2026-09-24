@@ -248,7 +248,18 @@ function registerIpc() {
       attachments = Array.isArray(payload.attachments) ? payload.attachments.slice(0, MAX_ATTACHMENTS) : [];
       const workspace = session.workspace || (await services.settingsStore.getInternal()).fileRoot || '';
       if (workspace) await rebuildToolSources(workspace, { allowActive: true });
-      const userMessage = { id: `msg_${crypto.randomUUID()}`, role: 'user', content: text, createdAt: Date.now() };
+      const userMessage = {
+        id: `msg_${crypto.randomUUID()}`,
+        role: 'user',
+        content: text,
+        createdAt: Date.now(),
+        attachments: attachments.map((file) => ({
+          name: String(file.name || path.basename(String(file.path || 'attachment'))).slice(0, 300),
+          path: String(file.path || '').slice(0, 4096),
+          size: Number(file.size || 0),
+          truncated: Boolean(file.truncated),
+        })),
+      };
       await services.sessionStore.appendMessage(sessionId, userMessage);
       title = await ensureSessionTitle(sessionId, text);
       sendEvent({ type: 'message', sessionId, message: userMessage });

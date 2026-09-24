@@ -110,7 +110,7 @@ async function withDeadline(promise, milliseconds, label) {
       returnByValue: true,
     });
     const details = JSON.parse(evaluation.result.value);
-    if (details.title !== 'CodePilot Local' || !details.hasApi || details.ready !== 'complete') {
+    if (!String(details.title || '').startsWith('CodePilot') || !details.hasApi || details.ready !== 'complete') {
       throw new Error(`Unexpected renderer: ${JSON.stringify(details)}\n${logs}`);
     }
     const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });

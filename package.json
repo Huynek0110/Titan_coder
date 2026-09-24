@@ -16,8 +16,8 @@
     "smoke": "node scripts/smoke-electron.js",
     "check": "node scripts/check-syntax.js",
     "icon": "python scripts/generate-icon.py",
-    "pack": "npm run check && npm test && electron-builder --dir",
-    "dist": "npm run check && npm test && electron-builder"
+    "pack": "npm run check && npm test && npm run smoke && electron-builder --dir",
+    "dist": "npm run check && npm test && npm run smoke && electron-builder"
   },
   "dependencies": {
     "ajv": "^8.17.1"

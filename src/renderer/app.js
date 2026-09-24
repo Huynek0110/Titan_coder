@@ -13,11 +13,12 @@
     lmBaseUrl: 'http://127.0.0.1:1234/v1',
     model: '',
     temperature: 0.2,
-    maxSteps: 24,
-    contextChars: 128000,
-    maxSubagents: 4,
+    maxSteps: 12,
+    contextChars: 24000,
+    maxSubagents: 3,
     concurrentSubagents: 2,
-    approvalMode: 'ask',
+    approvalMode: 'automatic',
+    allowFallbackTools: true,
     braveApiKey: '',
     ddgFallback: true,
     mcpServers: '{}',
@@ -135,7 +136,7 @@
     'settings-lm-url', 'settings-model', 'settings-refresh-models', 'settings-model-hint',
     'settings-temperature', 'settings-context-chars', 'settings-connection-dot',
     'settings-connection-title', 'settings-connection-detail', 'settings-test-btn', 'settings-max-steps',
-    'settings-approval-mode', 'settings-max-subagents', 'settings-concurrent-subagents',
+    'settings-approval-mode', 'settings-max-subagents', 'settings-concurrent-subagents', 'settings-allow-fallback-tools',
     'settings-brave-key', 'settings-ddg-fallback', 'settings-mcp-json', 'mcp-status-text',
     'mcp-status-detail', 'settings-reset-btn', 'settings-cancel-btn', 'settings-save-btn',
     'ask-user-modal', 'ask-user-close', 'ask-user-question', 'ask-user-options', 'ask-user-input',
@@ -348,6 +349,7 @@
       maxSubagents: numberOr(field(source, ['maxSubagents', 'subagentsMax'], DEFAULT_SETTINGS.maxSubagents), DEFAULT_SETTINGS.maxSubagents, 0, 16),
       concurrentSubagents: numberOr(field(source, ['concurrentSubagents', 'maxConcurrentSubagents', 'parallelSubagents'], DEFAULT_SETTINGS.concurrentSubagents), DEFAULT_SETTINGS.concurrentSubagents, 1, 8),
       approvalMode: stringOr(field(source, ['approvalMode', 'approval'], DEFAULT_SETTINGS.approvalMode), DEFAULT_SETTINGS.approvalMode),
+      allowFallbackTools: field(source, ['allowFallbackTools'], DEFAULT_SETTINGS.allowFallbackTools) !== false,
       braveApiKey: secret,
       braveApiKeyPresent: Boolean(field(source, ['braveApiKeyPresent', 'hasBraveApiKey'], Boolean(secret))),
       ddgFallback: fallbackValue === undefined ? (!webProvider || webProvider === 'duckduckgo') : Boolean(fallbackValue),
@@ -369,6 +371,7 @@
       concurrentSubagents: settings.concurrentSubagents,
       maxConcurrentSubagents: settings.concurrentSubagents,
       approvalMode: settings.approvalMode,
+      allowFallbackTools: settings.allowFallbackTools !== false,
       braveApiKey: settings.braveApiKey,
       ddgFallback: settings.ddgFallback,
       webProvider: settings.ddgFallback ? 'duckduckgo' : 'brave',
@@ -1906,6 +1909,7 @@
     dom['settings-approval-mode'].value = settings.approvalMode;
     dom['settings-max-subagents'].value = settings.maxSubagents;
     dom['settings-concurrent-subagents'].value = settings.concurrentSubagents;
+    dom['settings-allow-fallback-tools'].checked = settings.allowFallbackTools !== false;
     dom['settings-ddg-fallback'].checked = Boolean(settings.ddgFallback);
     dom['settings-brave-key'].value = '';
     dom['settings-brave-key'].placeholder = (settings.braveApiKeyPresent || settings.braveApiKey) ? 'Đã lưu — nhập lại để thay đổi' : 'Chưa cấu hình';
@@ -1934,6 +1938,7 @@
       approvalMode: dom['settings-approval-mode'].value,
       maxSubagents: maxSubagents,
       concurrentSubagents: concurrentSubagents,
+      allowFallbackTools: dom['settings-allow-fallback-tools'].checked,
       braveApiKey: brave || state.settings.braveApiKey,
       braveApiKeyPresent: Boolean(state.settings.braveApiKeyPresent || state.settings.braveApiKey || brave),
       ddgFallback: dom['settings-ddg-fallback'].checked,
@@ -2286,6 +2291,8 @@
           streamMessageId = null;
           setRunning(false);
           state.runId = null;
+          if (state.pendingAsk) { state.pendingAsk = null; closeModal('ask-user-modal'); }
+          if (state.pendingApproval) { state.pendingApproval = null; closeModal('approval-modal'); }
           addActivity('stage', { title: 'Đã dừng lượt chạy', detail: 'Tác nhân đã nhận yêu cầu dừng.', status: 'error' });
           renderMessages();
           break;

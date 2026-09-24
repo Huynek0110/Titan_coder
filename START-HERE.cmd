@@ -14,5 +14,12 @@ if not exist "node_modules\electron\dist\electron.exe" (
     pause
     exit /b 1
   )
+  echo Downloading the Electron runtime (resume-safe)...
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\install-electron-binary.ps1"
+  if errorlevel 1 (
+    echo Electron runtime download did not complete. Run this file again to resume.
+    pause
+    exit /b 1
+  )
 )
 call npm.cmd start

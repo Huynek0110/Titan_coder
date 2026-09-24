@@ -23,10 +23,12 @@ test('renderer keeps model output out of unsafe HTML/network sinks', () => {
   assert.doesNotMatch(app, /\beval\s*\(/);
   assert.match(app, /createTextNode/);
   assert.match(app, /isSafeHttpUrl/);
+  assert.match(html, /Content-Security-Policy/);
+  assert.doesNotMatch(html, /<script>\s*var savedTheme/);
 });
 
 test('onboarding and settings expose the expected local controls', () => {
-  for (const id of ['onboarding-test-btn', 'onboarding-start-btn', 'onboarding-install-btn', 'settings-mcp-json', 'ask-user-modal', 'approval-modal']) {
+  for (const id of ['onboarding-test-btn', 'onboarding-start-btn', 'onboarding-install-btn', 'settings-mcp-json', 'settings-allow-fallback-tools', 'ask-user-modal', 'approval-modal']) {
     assert.match(html, new RegExp(`id=["']${id}["']`));
     assert.match(app, new RegExp(`['"]${id}['"]`));
   }

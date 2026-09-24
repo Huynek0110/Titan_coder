@@ -59,6 +59,7 @@ const DEFAULT_SETTINGS = {
   maxConcurrentSubagents: 2,
   maxSubagentSteps: 8,
   approvalMode: 'automatic',
+  allowFallbackTools: true,
   fileRoot: '',
   webProvider: 'duckduckgo',
   braveApiKey: '',
@@ -101,6 +102,7 @@ const KNOWN_KEYS = new Set([
   'maxConcurrentSubagents',
   'maxSubagentSteps',
   'approvalMode',
+  'allowFallbackTools',
   'fileRoot',
   'webProvider',
   'searchProvider',
@@ -304,6 +306,9 @@ function sanitizeSettings(value) {
       case 'approvalMode':
         result[key] = normalizeEnum(candidate, APPROVAL_MODES, result[key]);
         break;
+      case 'allowFallbackTools':
+        result[key] = typeof candidate === 'boolean' ? candidate : result[key];
+        break;
       case 'fileRoot':
         result[key] = normalizePath(candidate, result[key]);
         break;
@@ -413,6 +418,10 @@ function validateSettingsPatch(patch, current = DEFAULT_SETTINGS) {
         result[key] = mode;
         break;
       }
+      case 'allowFallbackTools':
+        if (typeof candidate !== 'boolean') throw invalid('allowFallbackTools must be a boolean');
+        result[key] = candidate;
+        break;
       case 'fileRoot': {
         if (typeof candidate !== 'string') throw invalid('fileRoot must be a string');
         const text = candidate.trim();

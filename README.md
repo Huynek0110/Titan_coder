@@ -43,6 +43,12 @@ npm.cmd install
 npm.cmd start
 ```
 
+Nếu `npm.cmd exec -- electron --version` bị ngắt khi tải, chạy script có resume thay vì tải lại từ đầu:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-electron-binary.ps1
+```
+
 Trong ứng dụng:
 
 1. Chọn **Workspace** (thư mục dự án). Mọi file tool mặc định chỉ nằm trong workspace này.

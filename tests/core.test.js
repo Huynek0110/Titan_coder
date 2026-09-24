@@ -235,6 +235,29 @@ test('automatic fallback does not execute mutating tools', async () => {
   assert.deepEqual(calls, []);
 });
 
+test('explicit fallback compatibility setting allows Qwen mutating calls in automatic mode', async () => {
+  const calls = [];
+  const broker = new ToolBroker({ sources: [testToolSource(['write_file'], (name) => calls.push(name))] });
+  const responses = [
+    { content: '<call>{"name":"write_file","arguments":{"path":"x"}}</call>', toolCalls: [] },
+    { content: 'Fallback mutation completed.', toolCalls: [] },
+  ];
+  const runner = new AgentRunner({
+    lmClient: { chatStream: async () => responses.shift() },
+    broker,
+    getSettings: async () => ({
+      contextChars: 10_000,
+      maxSteps: 3,
+      maxSubagents: 0,
+      approvalMode: 'automatic',
+      allowFallbackTools: true,
+    }),
+  });
+  const result = await runner.run({ session: { workspace: 'C:\\workspace', messages: [] }, text: 'implement a change', mode: 'agent' });
+  assert.equal(result.text, 'Fallback mutation completed.');
+  assert.deepEqual(calls, ['write_file']);
+});
+
 test('fallback mutation requires explicit approval in ask mode', async () => {
   let calls = 0;
   let approvals = 0;

@@ -989,8 +989,9 @@ class AgentRunner {
       const definition = riskDefinition || { function: { name } };
       const fallbackReadOnly = isReadOnlyTool(name, definition);
       const approvalMode = String(safeSettings.approvalMode || 'automatic').toLowerCase();
-      if (mcp || (!fallbackReadOnly && approvalMode !== 'ask')) {
-        return { ok: false, summary: 'Fallback mutating tool bị từ chối', error: 'Fallback chỉ tự động được phép với read-only tool; cần approval mode ask cho thay đổi trạng thái.' };
+      const fallbackToolsAllowed = safeSettings.allowFallbackTools === true;
+      if ((mcp || !fallbackReadOnly) && !fallbackToolsAllowed && approvalMode !== 'ask') {
+        return { ok: false, summary: 'Fallback tool bị từ chối', error: 'Bật allowFallbackTools cho Qwen fallback hoặc dùng approval mode ask.' };
       }
     }
 
@@ -1030,6 +1031,7 @@ class AgentRunner {
       eventParentId: subagent?.id || null,
       mode: subagent ? 'plan' : safeMode,
       fallback: call.fallback === true,
+      allowFallbackTools: safeSettings.allowFallbackTools === true,
       allowedNames: Array.isArray(allowedNames) || allowedNames instanceof Set ? allowedNames : undefined,
       allowMutation: effectiveAllowMutation,
       allowMcp: effectiveAllowMcp,

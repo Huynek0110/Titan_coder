@@ -454,8 +454,10 @@ class ToolBroker {
       }
     }
     const risk = toolRisk(name, entry.definition);
-    if (context.fallback === true && risk.mutating && String(context.approvalMode || 'automatic').toLowerCase() !== 'ask') {
-      return { ok: false, error: 'Fallback mutating tool cần approval mode ask và xác nhận rõ ràng.' };
+    if (context.fallback === true && (risk.mutating || risk.mcp)
+      && context.allowFallbackTools !== true
+      && String(context.approvalMode || 'automatic').toLowerCase() !== 'ask') {
+      return { ok: false, error: 'Fallback tool cần allowFallbackTools=true hoặc approval mode ask.' };
     }
     // Mutation authority is explicit. A read-only call can use the broker
     // without extra ceremony; a mutating name needs allowMutation=true (or

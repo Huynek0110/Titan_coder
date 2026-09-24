@@ -2,20 +2,13 @@
 <html lang="vi" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
     <meta name="description" content="CodePilot — trợ lý lập trình cục bộ, nhanh và riêng tư." />
     <title>CodePilot — Trợ lý lập trình cục bộ</title>
     <link rel="stylesheet" href="styles.css" />
-    <script>
-      // Set the theme before the first paint when the user has chosen one.
-      try {
-        var savedTheme = localStorage.getItem('codepilot.theme');
-        if (savedTheme === 'light' || savedTheme === 'dark') {
-          document.documentElement.dataset.theme = savedTheme;
-        }
-      } catch (_) {}
-    </script>
+    <script src="theme-init.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Bỏ qua tới nội dung chính</a>
@@ -337,13 +330,14 @@
               <div class="panel-intro"><h3>Mô hình cục bộ</h3><p>CodePilot dùng API tương thích OpenAI từ LM Studio.</p></div>
               <div class="field-group"><label for="settings-lm-url">LM base URL</label><input id="settings-lm-url" type="url" value="http://127.0.0.1:1234/v1" spellcheck="false" /><p class="field-hint">Mặc định là <code>http://127.0.0.1:1234/v1</code>.</p></div>
               <div class="field-group"><label for="settings-model">Mô hình</label><div class="input-action-row"><input id="settings-model" type="text" placeholder="Ví dụ: qwen2.5-coder-7b" spellcheck="false" /><button class="secondary-button compact" id="settings-refresh-models" type="button"><svg aria-hidden="true"><use href="#i-refresh"></use></svg> Quét</button></div><p class="field-hint" id="settings-model-hint">Có thể nhập ID mô hình thủ công nếu chưa tải.</p></div>
-              <div class="settings-two-col"><div class="field-group"><label for="settings-temperature">Temperature</label><input id="settings-temperature" type="number" min="0" max="2" step="0.1" value="0.2" /><p class="field-hint">Thấp hơn → trả lời ổn định hơn.</p></div><div class="field-group"><label for="settings-context-chars">Giới hạn ngữ cảnh</label><div class="input-suffix"><input id="settings-context-chars" type="number" min="1000" max="2000000" step="1000" value="128000" /><span>chars</span></div><p class="field-hint">Dùng để ước lượng ngân sách ngữ cảnh.</p></div></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-temperature">Temperature</label><input id="settings-temperature" type="number" min="0" max="2" step="0.1" value="0.2" /><p class="field-hint">Thấp hơn → trả lời ổn định hơn.</p></div><div class="field-group"><label for="settings-context-chars">Giới hạn ngữ cảnh</label><div class="input-suffix"><input id="settings-context-chars" type="number" min="1000" max="2000000" step="1000" value="24000" /><span>chars</span></div><p class="field-hint">Dùng để ước lượng ngân sách ngữ cảnh.</p></div></div>
               <div class="connection-test-row"><div class="connection-state"><span class="connection-dot" id="settings-connection-dot"></span><div><strong id="settings-connection-title">Chưa kiểm tra</strong><span id="settings-connection-detail">Kiểm tra kết nối tới LM Studio</span></div></div><button class="secondary-button" id="settings-test-btn" type="button"><svg aria-hidden="true"><use href="#i-activity"></use></svg> Test connection</button></div>
             </section>
             <section class="settings-panel" data-settings-panel="agent" role="tabpanel" hidden>
               <div class="panel-intro"><h3>Thông tin tác nhân</h3><p>Điều chỉnh mức độ chủ động của Agent và các tác nhân phụ.</p></div>
-              <div class="settings-two-col"><div class="field-group"><label for="settings-max-steps">Số bước tối đa</label><div class="input-suffix"><input id="settings-max-steps" type="number" min="1" max="100" step="1" value="24" /><span>bước</span></div><p class="field-hint">Giới hạn vòng lặp suy nghĩ và thao tác.</p></div><div class="field-group"><label for="settings-approval-mode">Chế độ phê duyệt</label><div class="select-with-icon"><select id="settings-approval-mode"><option value="ask">Hỏi khi cần</option><option value="automatic">Tự động theo quy tắc</option><option value="always">Luôn hỏi</option><option value="never">Tự động tin cậy</option></select><svg aria-hidden="true"><use href="#i-chevron-down"></use></svg></div><p class="field-hint">Nên dùng “Hỏi khi cần” cho công việc thật.</p></div></div>
-              <div class="settings-two-col"><div class="field-group"><label for="settings-max-subagents">Tác nhân phụ tối đa</label><div class="input-suffix"><input id="settings-max-subagents" type="number" min="0" max="16" step="1" value="4" /><span>tác nhân</span></div></div><div class="field-group"><label for="settings-concurrent-subagents">Chạy đồng thời</label><div class="input-suffix"><input id="settings-concurrent-subagents" type="number" min="1" max="8" step="1" value="2" /><span>luồng</span></div></div></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-max-steps">Số bước tối đa</label><div class="input-suffix"><input id="settings-max-steps" type="number" min="1" max="100" step="1" value="12" /><span>bước</span></div><p class="field-hint">Giới hạn vòng lặp suy nghĩ và thao tác.</p></div><div class="field-group"><label for="settings-approval-mode">Chế độ phê duyệt</label><div class="select-with-icon"><select id="settings-approval-mode"><option value="automatic" selected>Tự động theo quy tắc</option><option value="ask">Hỏi khi cần</option></select><svg aria-hidden="true"><use href="#i-chevron-down"></use></svg></div><p class="field-hint">Nên dùng “Hỏi khi cần” cho công việc thật.</p></div></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-max-subagents">Tác nhân phụ tối đa</label><div class="input-suffix"><input id="settings-max-subagents" type="number" min="0" max="3" step="1" value="3" /><span>tác nhân</span></div></div><div class="field-group"><label for="settings-concurrent-subagents">Chạy đồng thời</label><div class="input-suffix"><input id="settings-concurrent-subagents" type="number" min="1" max="8" step="1" value="2" /><span>luồng</span></div></div></div>
+              <label class="switch-row"><span><strong>Cho phép fallback Qwen</strong><small>Cho phép tool call dạng <code>&lt;call&gt;</code> của LM Studio chạy tự động; vẫn bị giới hạn bởi allowlist và schema.</small></span><input id="settings-allow-fallback-tools" type="checkbox" checked /><span class="switch" aria-hidden="true"></span></label>
               <div class="settings-note warning-note"><svg aria-hidden="true"><use href="#i-shield"></use></svg><span>Agent có thể đọc hoặc thay đổi tệp trong workspace. Luôn kiểm tra yêu cầu phê duyệt trước khi đồng ý.</span></div>
             </section>
             <section class="settings-panel" data-settings-panel="web" role="tabpanel" hidden>
