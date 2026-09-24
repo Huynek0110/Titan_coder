@@ -263,6 +263,7 @@ function registerIpc() {
       await services.sessionStore.appendMessage(sessionId, userMessage);
       title = await ensureSessionTitle(sessionId, text);
       sendEvent({ type: 'message', sessionId, message: userMessage });
+      await persistRun(sessionId, runId, { status: 'running', mode, startedAt: Date.now() });
       sendEvent({ type: 'run-start', runId, sessionId, mode });
     } catch (error) {
       releaseRun(runId, sessionId);
@@ -289,14 +290,17 @@ function registerIpc() {
           usage: result.usage || null,
         };
         await services.sessionStore.appendMessage(sessionId, assistantMessage);
+        await persistRun(sessionId, runId, { status: 'completed', endedAt: Date.now(), usage: result.usage || null });
         sendEvent({ type: 'message', sessionId, message: assistantMessage });
         sendEvent({ type: 'run-complete', runId, sessionId, messageId: assistantMessage.id, title });
       } catch (error) {
         if (error?.name === 'AbortError' || controller.signal.aborted) {
+          await persistRun(sessionId, runId, { status: 'cancelled', endedAt: Date.now() });
           sendEvent({ type: 'run-cancelled', runId, sessionId });
           services.logger.info('Run cancelled', { runId, sessionId });
         } else {
           services.logger.error('Agent run failed', { runId, sessionId, error: error?.message || String(error) });
+          await persistRun(sessionId, runId, { status: 'failed', endedAt: Date.now(), error: String(error?.message || error).slice(0, 2000) });
           const message = `Mình gặp lỗi khi xử lý yêu cầu: ${error?.message || String(error)}`;
           sendEvent({ type: 'run-error', runId, sessionId, error: message });
         }
@@ -450,6 +454,14 @@ async function readSelectedFiles(filePaths) {
     });
   }
   return files;
+}
+
+async function persistRun(sessionId, runId, patch) {
+  try {
+    await services.sessionStore.updateRun(sessionId, runId, patch);
+  } catch (error) {
+    services.logger.warn('Could not persist run state', { sessionId, runId, error: error?.message || String(error) });
+  }
 }
 
 async function ensureSessionTitle(sessionId, text) {

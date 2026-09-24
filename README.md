@@ -15,6 +15,7 @@
 - Tool `ask_user`: model phải hỏi khi thiếu thông tin thay vì bịa.
 - Lịch sử session, dừng lượt chạy, giới hạn bước và log đã redact secret.
 - Không hiển thị tool protocol/JSON thô trong câu trả lời.
+- Qwen Q3 thường phát `<call>` thay vì `tool_calls` chuẩn; mặc định app có lớp tương thích được bật, nhưng vẫn kiểm tra allowlist/schema và có thể tắt trong Settings → Agent.
 
 ## Yêu cầu
 
