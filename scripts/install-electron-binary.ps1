@@ -4,9 +4,11 @@ $cacheDir = Join-Path $env:TEMP 'codepilot-electron-download'
 $zipPath = Join-Path $cacheDir "electron-v$version-win32-x64.zip"
 $dist = Join-Path (Get-Location) 'node_modules\electron\dist'
 New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-if (!(Test-Path -LiteralPath $zipPath)) {
+$existingSize = 0
+if (Test-Path -LiteralPath $zipPath) { $existingSize = (Get-Item -LiteralPath $zipPath).Length }
+if ($existingSize -lt 100MB) {
   $url = "https://github.com/electron/electron/releases/download/v$version/electron-v$version-win32-x64.zip"
-  & curl.exe --fail --location --retry 2 --connect-timeout 20 --max-time 600 --output $zipPath $url
+  & curl.exe --fail --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 1800 --continue-at - --silent --show-error --output $zipPath $url
   if ($LASTEXITCODE -ne 0) { throw "Electron download failed with exit code $LASTEXITCODE" }
 }
 if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
