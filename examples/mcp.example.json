@@ -1,0 +1,15 @@
+{
+  "playwright": {
+    "command": "npx",
+    "args": ["-y", "@playwright/mcp@latest"],
+    "cwd": "D:\\Coder_locally"
+  },
+  "filesystem-example": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "D:\\Coder_locally"
+    ]
+  }
+}

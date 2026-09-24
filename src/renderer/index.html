@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="vi" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="CodePilot — trợ lý lập trình cục bộ, nhanh và riêng tư." />
+    <title>CodePilot — Trợ lý lập trình cục bộ</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script>
+      // Set the theme before the first paint when the user has chosen one.
+      try {
+        var savedTheme = localStorage.getItem('codepilot.theme');
+        if (savedTheme === 'light' || savedTheme === 'dark') {
+          document.documentElement.dataset.theme = savedTheme;
+        }
+      } catch (_) {}
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Bỏ qua tới nội dung chính</a>
+
+    <!-- All icons are local SVG symbols. No font, image, or network asset is required. -->
+    <svg class="svg-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="i-logo" viewBox="0 0 32 32">
+        <path d="M8.5 7.5A4.5 4.5 0 0 1 13 3h6a4.5 4.5 0 0 1 4.5 4.5v1.2a4.3 4.3 0 0 1 0 8.6v1.2A4.5 4.5 0 0 1 19 23h-1.2v3.2a1.8 1.8 0 0 1-3.6 0V23h-1.2a4.5 4.5 0 0 1-4.5-4.5v-1.2a4.3 4.3 0 0 1 0-8.6V7.5Z" fill="currentColor" opacity=".18"/>
+        <path d="M11 9.2A3.7 3.7 0 0 1 14.7 5.5h2.6A3.7 3.7 0 0 1 21 9.2v.5a3.8 3.8 0 0 1 0 7.6v.5a3.7 3.7 0 0 1-3.7 3.7H18v2.1a1.3 1.3 0 0 1-2.6 0v-2.1h-.4A3.7 3.7 0 0 1 11 17.8v-.5a3.8 3.8 0 0 1 0-7.6v-.5Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        <path d="m13.2 13.1 1.9 1.9-1.9 1.9M18.8 13.1l-1.9 1.9 1.9 1.9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/>
+      </symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4.4 4.4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Z" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m19.4 13.4 1.1.8-1.8 3.1-1.3-.5a7.7 7.7 0 0 1-1.8 1l-.2 1.4h-3.6l-.2-1.4a7.7 7.7 0 0 1-1.8-1l-1.3.5-1.8-3.1 1.1-.8a7.2 7.2 0 0 1 0-2.1l-1.1-.8 1.8-3.1 1.3.5a7.7 7.7 0 0 1 1.8-1l.2-1.4h3.6l.2 1.4a7.7 7.7 0 0 1 1.8 1l1.3-.5 1.8 3.1-1.1.8a7.2 7.2 0 0 1 0 2.1Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.4"/></symbol>
+      <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9 4v16" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+      <symbol id="i-activity" viewBox="0 0 24 24"><path d="M4 17.5h3.2l2-9 3.1 13 2.5-9H20" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6.5 9 5.5 5.5L17.5 9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 6.5 5.5 5.5L9 17.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 6.5-5.5 5.5 5.5 5.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.8A2.3 2.3 0 0 1 5.8 5.5h4l1.8 2h6.6a2.3 2.3 0 0 1 2.3 2.3v7.7a2.3 2.3 0 0 1-2.3 2.3H5.8a2.3 2.3 0 0 1-2.3-2.3V7.8Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.7"/><path d="M3.8 10h16.4" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".55"/></symbol>
+      <symbol id="i-message" viewBox="0 0 24 24"><path d="M19.5 17.2a2 2 0 0 1-2 2H9l-4.5 2.3.9-4.1a2 2 0 0 1-.9-1.7V7a2 2 0 0 1 2-2h11.1a2 2 0 0 1 2 2v10.2Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3 1.2 4.8L18 9l-4.8 1.2L12 15l-1.2-4.8L6 9l4.8-1.2L12 3ZM19 14l.7 2.3L22 17l-2.3.7L19 20l-.7-2.3L16 17l2.3-.7L19 14ZM5 14l.6 1.9L7.5 16l-1.9.6L5 18.5l-.6-1.9L2.5 16l1.9-.6L5 14Z" fill="currentColor"/></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="m3.5 4.5 17 7.5-17 7.5 2.3-7.5-2.3-7.5Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.7"/><path d="M5.8 12h14.4" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+      <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m8.3 12.8 6.9-6.9a3.2 3.2 0 0 1 4.5 4.5l-8.4 8.4a4.7 4.7 0 0 1-6.6-6.6l8.1-8.1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.2" y="6.2" width="11.6" height="11.6" rx="1.8" fill="currentColor"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v9A2.5 2.5 0 0 0 6.5 18H8" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 8.5A8 8 0 1 0 20 14" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/><path d="M19.5 4.5v4h-4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.3 4.3L19 7.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"/></symbol>
+      <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m8 12.2 2.6 2.6 5.5-5.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="m12 4 8 15H4L12 4Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.7"/><path d="M12 9v4.3M12 16.3v.1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.9"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 10.7v5M12 7.5v.1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.9"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 7.5v5l3.2 2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m7 10 2.5 2L7 14M11.5 14h4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/></symbol>
+      <symbol id="i-code" viewBox="0 0 24 24"><path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4M13.5 5.5l-3 13" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5.5 19.5a6.5 6.5 0 0 1 13 0" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-bot" viewBox="0 0 24 24"><rect x="4.5" y="7" width="15" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 4.5V7M8.5 11v.1M15.5 11v.1M8 15.2c1.1.8 2.4 1.2 4 1.2s2.9-.4 4-1.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/><path d="M3 11.5v3M21 11.5v3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="m6.5 6.5 11 11M17.5 6.5l-11 11" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-external" viewBox="0 0 24 24"><path d="M13.5 5H19v5.5M18.5 5.5l-8 8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/><path d="M18 13.5v4A1.5 1.5 0 0 1 16.5 19h-10A1.5 1.5 0 0 1 5 17.5v-10A1.5 1.5 0 0 1 6.5 6H11" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-link" viewBox="0 0 24 24"><path d="M9.5 14.5 14.5 9.5M7.2 17.8l-1 1a3.2 3.2 0 0 1-4.5-4.5l3.6-3.6a3.2 3.2 0 0 1 4.5 0M16.8 6.2l1-1a3.2 3.2 0 0 1 4.5 4.5l-3.6 3.6a3.2 3.2 0 0 1-4.5 0" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.4 15.4A7.8 7.8 0 0 1 8.6 4.6 8.2 8.2 0 1 0 19.4 15.4Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2.8v2M12 19.2v2M21.2 12h-2M4.8 12h-2M18.5 5.5 17 7M7 17l-1.5 1.5M18.5 18.5 17 17M7 7 5.5 5.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24"><path d="m14.5 5.5 4 4M5 19l3.8-.8L19.2 7.8a2.1 2.1 0 0 0-3-3L5.8 15.2 5 19Z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v10M8.5 10.5 12 14l3.5-3.5M5 18.5h14" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.5 19 6v5.2c0 4.3-2.7 7.7-7 9.3-4.3-1.6-7-5-7-9.3V6l7-2.5Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.7"/><path d="m8.8 12 2.1 2.1 4.4-4.4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9.5 2.8v3.7M14.5 2.8v3.7M9.5 17.5v3.7M14.5 17.5v3.7M2.8 9.5h3.7M2.8 14.5h3.7M17.5 9.5h3.7M17.5 14.5h3.7" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-web" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3.8 12h16.4M12 3.5c2.1 2.3 3.1 5.1 3.1 8.5s-1 6.2-3.1 8.5c-2.1-2.3-3.1-5.1-3.1-8.5s1-6.2 3.1-8.5Z" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+      <symbol id="i-mcp" viewBox="0 0 24 24"><path d="M7 7.5a3 3 0 1 1 4.2 2.7L9.8 12a3 3 0 1 1-2.1 5.1M17 7.5a3 3 0 1 0-4.2 2.7l1.4 1.8a3 3 0 1 0 2.1 5.1M9 12h6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16M8 4v6M16 14v6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7"/><circle cx="8" cy="7" r="2" fill="var(--surface-2)" stroke="currentColor" stroke-width="1.7"/><circle cx="16" cy="17" r="2" fill="var(--surface-2)" stroke="currentColor" stroke-width="1.7"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m8.5 5.5 10 6.5-10 6.5v-13Z" fill="currentColor"/></symbol>
+      <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="18.5" cy="12" r="1.3" fill="currentColor"/></symbol>
+      <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></symbol>
+      <symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 0 8.5 8.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2"/></symbol>
+    </svg>
+
+    <div class="app-shell" id="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="Điều hướng chính">
+        <div class="sidebar-top">
+          <div class="brand-row">
+            <div class="brand-mark" aria-hidden="true"><svg><use href="#i-logo"></use></svg></div>
+            <div class="brand-copy">
+              <span class="brand-name">CodePilot</span>
+              <span class="brand-subtitle">LOCAL · PRIVATE</span>
+            </div>
+            <button class="icon-button sidebar-collapse" id="sidebar-collapse" type="button" aria-label="Ẩn thanh bên" title="Ẩn thanh bên (Ctrl+B)">
+              <svg aria-hidden="true"><use href="#i-sidebar"></use></svg>
+            </button>
+          </div>
+
+          <button class="new-chat-button" id="new-chat-btn" type="button">
+            <span class="new-chat-icon"><svg aria-hidden="true"><use href="#i-plus"></use></svg></span>
+            <span>Cuộc trò chuyện mới</span>
+            <kbd>⌘ K</kbd>
+          </button>
+
+          <div class="sidebar-search">
+            <svg aria-hidden="true"><use href="#i-search"></use></svg>
+            <label class="sr-only" for="session-search">Tìm kiếm cuộc trò chuyện</label>
+            <input id="session-search" type="search" autocomplete="off" placeholder="Tìm cuộc trò chuyện" />
+            <button id="session-filter-btn" class="filter-button" type="button" aria-label="Bộ lọc cuộc trò chuyện" title="Bộ lọc">
+              <svg aria-hidden="true"><use href="#i-filter"></use></svg>
+            </button>
+          </div>
+
+          <div class="session-list-wrap">
+            <div class="sidebar-section-label">
+              <span>LỊCH SỬ</span>
+              <span class="session-count" id="session-count">0</span>
+            </div>
+            <nav class="session-list" id="session-list" aria-label="Danh sách cuộc trò chuyện"></nav>
+            <div class="session-list-empty" id="session-list-empty" hidden>
+              <svg aria-hidden="true"><use href="#i-message"></use></svg>
+              <span>Chưa có cuộc trò chuyện</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="sidebar-bottom">
+          <button class="workspace-compact" id="workspace-selector" type="button" title="Chọn workspace">
+            <span class="workspace-icon"><svg aria-hidden="true"><use href="#i-folder"></use></svg></span>
+            <span class="workspace-info">
+              <span class="workspace-label">WORKSPACE</span>
+              <strong id="sidebar-workspace-name">Chưa chọn</strong>
+            </span>
+            <svg class="workspace-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+          </button>
+          <div class="sidebar-actions">
+            <button class="sidebar-action" id="settings-btn" type="button">
+              <svg aria-hidden="true"><use href="#i-settings"></use></svg>
+              <span>Cài đặt</span>
+            </button>
+            <button class="sidebar-action theme-toggle" id="theme-toggle" type="button" aria-label="Chuyển giao diện sáng/tối" title="Giao diện sáng/tối">
+              <svg class="theme-moon" aria-hidden="true"><use href="#i-moon"></use></svg>
+              <svg class="theme-sun" aria-hidden="true"><use href="#i-sun"></use></svg>
+              <span>Giao diện</span>
+            </button>
+          </div>
+          <div class="offline-note"><span class="offline-dot"></span> Chạy hoàn toàn trên máy của bạn</div>
+        </div>
+      </aside>
+
+      <div class="sidebar-scrim" id="sidebar-scrim" hidden></div>
+
+      <main class="main-column" id="main-content" tabindex="-1">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-button mobile-sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Mở thanh bên" aria-expanded="false" title="Mở thanh bên">
+              <svg aria-hidden="true"><use href="#i-sidebar"></use></svg>
+            </button>
+            <div class="workspace-heading">
+              <span class="topbar-overline">WORKSPACE</span>
+              <button class="workspace-heading-button" id="header-workspace" type="button" title="Đổi workspace">
+                <span id="header-workspace-name">Chưa chọn workspace</span>
+                <svg aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+              </button>
+            </div>
+          </div>
+          <div class="topbar-right">
+            <div class="model-status-pill" id="model-status-pill" role="status" aria-live="polite" title="Trạng thái mô hình">
+              <span class="status-pulse" id="model-status-dot"></span>
+              <span id="model-status-text">Đang kiểm tra</span>
+              <span class="status-model-name" id="header-model-name">—</span>
+            </div>
+            <label class="mode-control" for="mode-select">
+              <span class="sr-only">Chế độ trợ lý</span>
+              <svg aria-hidden="true"><use href="#i-sliders"></use></svg>
+              <select id="mode-select" aria-label="Chế độ trợ lý">
+                <option value="chat">Hội thoại</option>
+                <option value="agent">Agent</option>
+                <option value="plan">Lập kế hoạch</option>
+              </select>
+              <svg class="select-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+            </label>
+            <button class="icon-button activity-toggle" id="activity-toggle" type="button" aria-label="Mở hoạt động" aria-expanded="true" title="Hoạt động (Ctrl+I)">
+              <svg aria-hidden="true"><use href="#i-activity"></use></svg>
+              <span class="activity-count" id="activity-count" hidden>0</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="chat-area" aria-label="Cuộc trò chuyện">
+          <div class="state-panel loading-panel" id="chat-loading" hidden aria-live="polite">
+            <span class="loading-orb"><svg aria-hidden="true"><use href="#i-loader"></use></svg></span>
+            <strong>Đang mở không gian làm việc</strong>
+            <span>Đồng bộ cuộc trò chuyện và cấu hình cục bộ…</span>
+          </div>
+          <div class="state-panel error-panel" id="chat-error" hidden role="alert">
+            <span class="state-icon error-icon"><svg aria-hidden="true"><use href="#i-alert"></use></svg></span>
+            <strong>Không thể tải cuộc trò chuyện</strong>
+            <span id="chat-error-text">Đã xảy ra lỗi. Bạn có thể thử lại.</span>
+            <button class="secondary-button" id="retry-load-btn" type="button"><svg aria-hidden="true"><use href="#i-refresh"></use></svg> Thử lại</button>
+          </div>
+
+          <div class="welcome-screen" id="welcome-screen">
+            <div class="welcome-glow" aria-hidden="true"></div>
+            <div class="welcome-orb" aria-hidden="true"><svg><use href="#i-logo"></use></svg></div>
+            <p class="eyebrow"><span class="eyebrow-line"></span> TRỢ LÝ LẬP TRÌNH CỤC BỘ <span class="eyebrow-line"></span></p>
+            <h1>Bạn muốn tạo điều gì<br /><em>hôm nay?</em></h1>
+            <p class="welcome-description">Một không gian riêng tư để suy nghĩ, viết mã và cùng tác nhân thông minh giải quyết công việc.</p>
+            <div class="capability-grid" aria-label="Gợi ý nhanh">
+              <button class="capability-card" type="button" data-prompt="Giải thích cấu trúc dự án này và tóm tắt các điểm cần chú ý.">
+                <span class="capability-icon violet"><svg aria-hidden="true"><use href="#i-sparkles"></use></svg></span>
+                <span class="capability-copy"><strong>Khám phá dự án</strong><span>Hiểu codebase trong vài giây</span></span>
+                <svg class="capability-arrow" aria-hidden="true"><use href="#i-arrow-up"></use></svg>
+              </button>
+              <button class="capability-card" type="button" data-prompt="Giúp tôi viết một hàm TypeScript cho tệp này, kèm giải thích ngắn gọn.">
+                <span class="capability-icon cyan"><svg aria-hidden="true"><use href="#i-code"></use></svg></span>
+                <span class="capability-copy"><strong>Viết mã cùng nhau</strong><span>Từ ý tưởng đến triển khai</span></span>
+                <svg class="capability-arrow" aria-hidden="true"><use href="#i-arrow-up"></use></svg>
+              </button>
+              <button class="capability-card" type="button" data-prompt="Hãy lập kế hoạch triển khai tính năng này, gồm các bước và điểm rủi ro.">
+                <span class="capability-icon amber"><svg aria-hidden="true"><use href="#i-sparkles"></use></svg></span>
+                <span class="capability-copy"><strong>Lập kế hoạch</strong><span>Biến ý tưởng thành bước đi</span></span>
+                <svg class="capability-arrow" aria-hidden="true"><use href="#i-arrow-up"></use></svg>
+              </button>
+            </div>
+            <div class="welcome-hint"><svg aria-hidden="true"><use href="#i-shield"></use></svg><span>Mọi cuộc trò chuyện được giữ trên máy của bạn</span></div>
+          </div>
+
+          <div class="messages-container" id="messages-container" role="log" aria-live="polite" aria-relevant="additions text" hidden></div>
+        </section>
+
+        <footer class="composer-wrap" id="composer-area">
+          <div class="attachment-list" id="attachment-list" aria-label="Tệp đính kèm" hidden></div>
+          <form class="composer" id="composer-form" novalidate>
+            <button class="composer-attach" id="attach-btn" type="button" aria-label="Đính kèm tệp" title="Đính kèm tệp">
+              <svg aria-hidden="true"><use href="#i-paperclip"></use></svg>
+            </button>
+            <label class="sr-only" for="message-input">Nhập tin nhắn</label>
+            <textarea id="message-input" rows="1" placeholder="Nhắn CodePilot để bắt đầu…" autocomplete="off" spellcheck="true"></textarea>
+            <div class="composer-actions">
+              <span class="composer-mode-hint" id="composer-mode-hint">Enter để gửi · Shift + Enter xuống dòng</span>
+              <button class="stop-button" id="stop-btn" type="button" hidden aria-label="Dừng tác nhân" title="Dừng">
+                <svg aria-hidden="true"><use href="#i-stop"></use></svg>
+              </button>
+              <button class="send-button" id="send-btn" type="submit" aria-label="Gửi tin nhắn" title="Gửi (Enter)" disabled>
+                <svg aria-hidden="true"><use href="#i-send"></use></svg>
+              </button>
+            </div>
+          </form>
+          <div class="composer-meta">
+            <span class="composer-limit" id="context-indicator"><svg aria-hidden="true"><use href="#i-info"></use></svg> <span>0 / 32k ngữ cảnh</span></span>
+            <span class="composer-limit" id="token-indicator"><svg aria-hidden="true"><use href="#i-sparkles"></use></svg> <span>~0 token · Không dùng API ngoài</span></span>
+            <span class="composer-disclaimer">CodePilot có thể sai lệch. Hãy kiểm tra kết quả.</span>
+          </div>
+        </footer>
+      </main>
+
+      <aside class="activity-panel" id="activity-panel" aria-label="Hoạt động tác nhân" aria-hidden="false">
+        <div class="activity-header">
+          <div>
+            <p class="topbar-overline">THEO DÕI</p>
+            <h2>Hoạt động</h2>
+          </div>
+          <button class="icon-button" id="activity-close" type="button" aria-label="Đóng bảng hoạt động" title="Đóng bảng hoạt động">
+            <svg aria-hidden="true"><use href="#i-x"></use></svg>
+          </button>
+        </div>
+        <div class="activity-summary" id="activity-summary">
+          <span class="summary-status"><span class="summary-dot" id="summary-dot"></span><span id="summary-status-text">Sẵn sàng</span></span>
+          <span id="activity-duration">—</span>
+        </div>
+        <div class="activity-timeline" id="activity-timeline">
+          <div class="activity-empty" id="activity-empty">
+            <span class="activity-empty-icon"><svg aria-hidden="true"><use href="#i-activity"></use></svg></span>
+            <strong>Chưa có hoạt động</strong>
+            <span>Các bước của tác nhân sẽ xuất hiện ở đây.</span>
+          </div>
+        </div>
+        <div class="activity-footer"><svg aria-hidden="true"><use href="#i-shield"></use></svg><span>Thông tin công cụ được rút gọn để dễ đọc.</span></div>
+      </aside>
+    </div>
+
+    <!-- First-run setup -->
+    <div class="modal-backdrop" id="onboarding-modal" hidden>
+      <section class="modal onboarding-modal" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-description">
+        <div class="onboarding-aside">
+          <div class="modal-brand"><span class="brand-mark small"><svg aria-hidden="true"><use href="#i-logo"></use></svg></span><span>CodePilot</span></div>
+          <p class="eyebrow">BẮT ĐẦU TẠI ĐÂY</p>
+          <h2>Trợ lý cục bộ,<br /><em>trong tầm tay.</em></h2>
+          <p class="onboarding-aside-copy">Kết nối một mô hình chạy trên máy để mọi cuộc trò chuyện nhanh, riêng tư và không cần cloud.</p>
+          <div class="onboarding-steps" aria-label="Các bước thiết lập">
+            <div class="onboarding-step is-active" data-onboarding-indicator="1"><span>1</span><div><strong>Kết nối LM Studio</strong><small>Kiểm tra máy chủ cục bộ</small></div></div>
+            <div class="onboarding-step" data-onboarding-indicator="2"><span>2</span><div><strong>Chọn mô hình</strong><small>Tải mô hình đã cài</small></div></div>
+            <div class="onboarding-step" data-onboarding-indicator="3"><span>3</span><div><strong>Chọn workspace</strong><small>Nơi bạn muốn làm việc</small></div></div>
+          </div>
+          <div class="onboarding-privacy"><svg aria-hidden="true"><use href="#i-shield"></use></svg><span>Ưu tiên quyền riêng tư · Không gửi mã nguồn đi</span></div>
+        </div>
+        <div class="onboarding-main">
+          <button class="modal-close" id="onboarding-close" type="button" aria-label="Đóng thiết lập"><svg aria-hidden="true"><use href="#i-x"></use></svg></button>
+          <div class="onboarding-step-panel is-visible" data-onboarding-step="1">
+            <div class="step-heading"><span class="step-number">01</span><div><h1 id="onboarding-title">Kết nối LM Studio</h1><p id="onboarding-description">Ứng dụng sẽ tự tìm LM Studio trên máy tính của bạn.</p></div></div>
+            <div class="setup-callout"><span class="callout-icon"><svg aria-hidden="true"><use href="#i-info"></use></svg></span><p>CodePilot có thể quét <code>localhost</code> và kết nối tự động. Bạn <strong>không cần biết đường dẫn tệp GGUF</strong> — chỉ cần bật máy chủ API trong LM Studio.</p></div>
+            <ol class="setup-checklist">
+              <li><span class="checklist-number">1</span><span>Mở <strong>LM Studio</strong> trên máy tính.</span></li>
+              <li><span class="checklist-number">2</span><span>Mở tab <strong>Developer</strong> → bật <strong>Local Server</strong>.</span></li>
+              <li><span class="checklist-number">3</span><span>Đảm bảo cổng là <code>1234</code> hoặc để CodePilot tự dò.</span></li>
+            </ol>
+            <div class="connection-row"><div class="connection-state"><span class="connection-dot" id="onboarding-connection-dot"></span><div><strong id="onboarding-connection-title">Chưa kiểm tra</strong><span id="onboarding-connection-detail">Chưa có phản hồi từ LM Studio</span></div></div><button class="secondary-button" id="onboarding-test-btn" type="button"><svg aria-hidden="true"><use href="#i-activity"></use></svg> Test connection</button></div>
+            <div class="button-row"><button class="ghost-button" id="onboarding-start-btn" type="button"><svg aria-hidden="true"><use href="#i-play"></use></svg> Start LM Studio</button><button class="ghost-button" id="onboarding-install-btn" type="button" title="Install lms CLI"><svg aria-hidden="true"><use href="#i-download"></use></svg> Cài lms CLI</button></div>
+            <p class="setup-error" id="onboarding-error" role="alert" hidden></p>
+          </div>
+          <div class="onboarding-step-panel" data-onboarding-step="2" hidden>
+            <div class="step-heading"><span class="step-number">02</span><div><h2>Chọn mô hình</h2><p>Dùng một mô hình đã được LM Studio nhận diện.</p></div></div>
+            <div class="field-group"><label for="onboarding-model-select">Mô hình</label><div class="select-with-icon"><select id="onboarding-model-select"><option value="">Chưa có mô hình khả dụng</option></select><svg aria-hidden="true"><use href="#i-chevron-down"></use></svg></div><p class="field-hint" id="onboarding-model-hint">Kết nối LM Studio trước để xem danh sách mô hình.</p></div>
+            <button class="secondary-button full-width" id="onboarding-load-btn" type="button"><svg aria-hidden="true"><use href="#i-cpu"></use></svg> Nạp mô hình đã chọn</button>
+            <div class="model-loaded-card" id="onboarding-model-loaded" hidden><span class="model-check"><svg aria-hidden="true"><use href="#i-check"></use></svg></span><div><strong id="onboarding-loaded-name">Mô hình đã sẵn sàng</strong><span>Sẵn sàng trả lời trên máy của bạn</span></div></div>
+          </div>
+          <div class="onboarding-step-panel" data-onboarding-step="3" hidden>
+            <div class="step-heading"><span class="step-number">03</span><div><h2>Chọn workspace</h2><p>Chọn thư mục dự án để tác nhân có thể đọc và chỉnh sửa trong phạm vi đó.</p></div></div>
+            <div class="workspace-picker-large"><span class="workspace-picker-icon"><svg aria-hidden="true"><use href="#i-folder"></use></svg></span><div><span class="field-label">WORKSPACE HIỆN TẠI</span><strong id="onboarding-workspace-name">Chưa chọn thư mục</strong><span id="onboarding-workspace-path">Bạn có thể thay đổi sau trong Cài đặt.</span></div><button class="secondary-button compact" id="onboarding-workspace-pick" type="button">Chọn</button></div>
+            <div class="setup-callout compact-callout"><span class="callout-icon"><svg aria-hidden="true"><use href="#i-shield"></use></svg></span><p>Chỉ cấp quyền cho thư mục bạn tin cậy. Bạn luôn có thể xem lại và từ chối mọi thao tác.</p></div>
+          </div>
+          <div class="onboarding-footer"><button class="text-button" id="onboarding-back-btn" type="button" hidden><svg aria-hidden="true"><use href="#i-chevron-left"></use></svg> Quay lại</button><span></span><button class="primary-button" id="onboarding-continue" type="button" disabled>Tiếp tục <svg aria-hidden="true"><use href="#i-chevron-right"></use></svg></button></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Settings drawer -->
+    <div class="modal-backdrop" id="settings-modal" hidden>
+      <section class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="settings-header"><div><p class="topbar-overline">KHÔNG GIAN CỦA BẠN</p><h2 id="settings-title">Cài đặt</h2></div><button class="modal-close" id="settings-close" type="button" aria-label="Đóng cài đặt"><svg aria-hidden="true"><use href="#i-x"></use></svg></button></div>
+        <div class="settings-body">
+          <nav class="settings-tabs" role="tablist" aria-label="Mục cài đặt">
+            <button class="settings-tab is-active" type="button" role="tab" aria-selected="true" data-settings-tab="general"><svg aria-hidden="true"><use href="#i-sliders"></use></svg>Chung</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="model"><svg aria-hidden="true"><use href="#i-cpu"></use></svg>Mô hình</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="agent"><svg aria-hidden="true"><use href="#i-sparkles"></use></svg>Tác nhân</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="web"><svg aria-hidden="true"><use href="#i-web"></use></svg>Web</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="mcp"><svg aria-hidden="true"><use href="#i-mcp"></use></svg>MCP</button>
+          </nav>
+          <div class="settings-panels">
+            <section class="settings-panel is-active" data-settings-panel="general" role="tabpanel">
+              <div class="panel-intro"><h3>Cài đặt chung</h3><p>Chọn nơi CodePilot hoạt động và cách ứng dụng hiển thị.</p></div>
+              <div class="field-group"><div class="field-label-row"><label for="settings-workspace">Workspace mặc định</label><button class="inline-link" id="settings-workspace-pick" type="button">Chọn thư mục</button></div><div class="path-input"><svg aria-hidden="true"><use href="#i-folder"></use></svg><input id="settings-workspace" type="text" placeholder="Chưa chọn workspace" readonly /><button class="icon-button tiny" id="settings-workspace-clear" type="button" aria-label="Xóa workspace"><svg aria-hidden="true"><use href="#i-x"></use></svg></button></div><p class="field-hint">Tác nhân chỉ làm việc trong workspace bạn cho phép.</p></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-theme">Giao diện</label><div class="select-with-icon"><select id="settings-theme"><option value="dark">Tối</option><option value="light">Sáng</option><option value="system">Theo hệ thống</option></select><svg aria-hidden="true"><use href="#i-chevron-down"></use></svg></div></div><div class="field-group"><label for="settings-language">Ngôn ngữ</label><div class="select-with-icon"><select id="settings-language"><option value="vi">Tiếng Việt</option></select><svg aria-hidden="true"><use href="#i-chevron-down"></use></svg></div></div></div>
+              <div class="settings-note"><svg aria-hidden="true"><use href="#i-shield"></use></svg><span>CodePilot ưu tiên dữ liệu cục bộ. Khóa API được lưu trong kho cấu hình của ứng dụng, không đưa vào HTML.</span></div>
+            </section>
+            <section class="settings-panel" data-settings-panel="model" role="tabpanel" hidden>
+              <div class="panel-intro"><h3>Mô hình cục bộ</h3><p>CodePilot dùng API tương thích OpenAI từ LM Studio.</p></div>
+              <div class="field-group"><label for="settings-lm-url">LM base URL</label><input id="settings-lm-url" type="url" value="http://127.0.0.1:1234/v1" spellcheck="false" /><p class="field-hint">Mặc định là <code>http://127.0.0.1:1234/v1</code>.</p></div>
+              <div class="field-group"><label for="settings-model">Mô hình</label><div class="input-action-row"><input id="settings-model" type="text" placeholder="Ví dụ: qwen2.5-coder-7b" spellcheck="false" /><button class="secondary-button compact" id="settings-refresh-models" type="button"><svg aria-hidden="true"><use href="#i-refresh"></use></svg> Quét</button></div><p class="field-hint" id="settings-model-hint">Có thể nhập ID mô hình thủ công nếu chưa tải.</p></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-temperature">Temperature</label><input id="settings-temperature" type="number" min="0" max="2" step="0.1" value="0.2" /><p class="field-hint">Thấp hơn → trả lời ổn định hơn.</p></div><div class="field-group"><label for="settings-context-chars">Giới hạn ngữ cảnh</label><div class="input-suffix"><input id="settings-context-chars" type="number" min="1000" max="2000000" step="1000" value="128000" /><span>chars</span></div><p class="field-hint">Dùng để ước lượng ngân sách ngữ cảnh.</p></div></div>
+              <div class="connection-test-row"><div class="connection-state"><span class="connection-dot" id="settings-connection-dot"></span><div><strong id="settings-connection-title">Chưa kiểm tra</strong><span id="settings-connection-detail">Kiểm tra kết nối tới LM Studio</span></div></div><button class="secondary-button" id="settings-test-btn" type="button"><svg aria-hidden="true"><use href="#i-activity"></use></svg> Test connection</button></div>
+            </section>
+            <section class="settings-panel" data-settings-panel="agent" role="tabpanel" hidden>
+              <div class="panel-intro"><h3>Thông tin tác nhân</h3><p>Điều chỉnh mức độ chủ động của Agent và các tác nhân phụ.</p></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-max-steps">Số bước tối đa</label><div class="input-suffix"><input id="settings-max-steps" type="number" min="1" max="100" step="1" value="24" /><span>bước</span></div><p class="field-hint">Giới hạn vòng lặp suy nghĩ và thao tác.</p></div><div class="field-group"><label for="settings-approval-mode">Chế độ phê duyệt</label><div class="select-with-icon"><select id="settings-approval-mode"><option value="ask">Hỏi khi cần</option><option value="automatic">Tự động theo quy tắc</option><option value="always">Luôn hỏi</option><option value="never">Tự động tin cậy</option></select><svg aria-hidden="true"><use href="#i-chevron-down"></use></svg></div><p class="field-hint">Nên dùng “Hỏi khi cần” cho công việc thật.</p></div></div>
+              <div class="settings-two-col"><div class="field-group"><label for="settings-max-subagents">Tác nhân phụ tối đa</label><div class="input-suffix"><input id="settings-max-subagents" type="number" min="0" max="16" step="1" value="4" /><span>tác nhân</span></div></div><div class="field-group"><label for="settings-concurrent-subagents">Chạy đồng thời</label><div class="input-suffix"><input id="settings-concurrent-subagents" type="number" min="1" max="8" step="1" value="2" /><span>luồng</span></div></div></div>
+              <div class="settings-note warning-note"><svg aria-hidden="true"><use href="#i-shield"></use></svg><span>Agent có thể đọc hoặc thay đổi tệp trong workspace. Luôn kiểm tra yêu cầu phê duyệt trước khi đồng ý.</span></div>
+            </section>
+            <section class="settings-panel" data-settings-panel="web" role="tabpanel" hidden>
+              <div class="panel-intro"><h3>Công cụ Web</h3><p>Tùy chọn dùng Brave Search hoặc fallback DuckDuckGo cho các tác vụ tra cứu.</p></div>
+              <div class="field-group"><label for="settings-brave-key">Brave API key <span class="optional-label">Tùy chọn</span></label><div class="path-input"><svg aria-hidden="true"><use href="#i-web"></use></svg><input id="settings-brave-key" type="password" placeholder="Chưa cấu hình" autocomplete="off" /></div><p class="field-hint">Khóa được đọc qua API cấu hình, không hiển thị trong giao diện.</p></div>
+              <label class="switch-row"><span><strong>Cho phép fallback DDG</strong><small>Dùng DuckDuckGo khi Brave không khả dụng.</small></span><input id="settings-ddg-fallback" type="checkbox" checked /><span class="switch" aria-hidden="true"></span></label>
+              <div class="settings-note"><svg aria-hidden="true"><use href="#i-info"></use></svg><span>Renderer không tự gọi Internet. Mọi yêu cầu web được gửi qua lớp điều khiển của ứng dụng.</span></div>
+            </section>
+            <section class="settings-panel" data-settings-panel="mcp" role="tabpanel" hidden>
+              <div class="panel-intro"><h3>Máy chủ MCP</h3><p>Cấu hình các MCP server mà tác nhân được phép sử dụng.</p></div>
+              <div class="field-group"><label for="settings-mcp-json">MCP servers (JSON)</label><textarea id="settings-mcp-json" rows="10" spellcheck="false" placeholder='{"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"]}}'></textarea><p class="field-hint">JSON object hợp lệ sẽ được kiểm tra trước khi lưu.</p></div>
+              <div class="mcp-status-card"><div><span class="mcp-status-dot"></span><strong id="mcp-status-text">Chưa kiểm tra</strong></div><span id="mcp-status-detail">Các server sẽ hiển thị khi được kết nối.</span></div>
+            </section>
+          </div>
+        </div>
+        <div class="settings-footer"><button class="text-button danger-text" id="settings-reset-btn" type="button">Đặt lại</button><div class="footer-spacer"></div><button class="ghost-button" id="settings-cancel-btn" type="button">Hủy</button><button class="primary-button" id="settings-save-btn" type="button"><svg aria-hidden="true"><use href="#i-check"></use></svg> Lưu cài đặt</button></div>
+      </section>
+    </div>
+
+    <!-- Ask user modal -->
+    <div class="modal-backdrop" id="ask-user-modal" hidden>
+      <section class="modal small-modal" role="dialog" aria-modal="true" aria-labelledby="ask-user-title" aria-describedby="ask-user-question">
+        <div class="small-modal-icon question-icon"><svg aria-hidden="true"><use href="#i-message"></use></svg></div>
+        <button class="modal-close" id="ask-user-close" type="button" aria-label="Đóng"><svg aria-hidden="true"><use href="#i-x"></use></svg></button>
+        <h2 id="ask-user-title">Tác nhân cần câu trả lời</h2>
+        <p class="modal-lead" id="ask-user-question">Bạn có thể trả lời câu hỏi của tác nhân.</p>
+        <div class="ask-options" id="ask-user-options"></div>
+        <div class="field-group"><label for="ask-user-input">Câu trả lời của bạn</label><textarea id="ask-user-input" rows="4" placeholder="Nhập câu trả lời…"></textarea></div>
+        <p class="modal-error" id="ask-user-error" role="alert" hidden></p>
+        <div class="modal-actions"><button class="ghost-button" id="ask-user-reject" type="button">Từ chối</button><button class="ghost-button" id="ask-user-cancel" type="button">Bỏ qua</button><button class="primary-button" id="ask-user-resolve" type="button"><svg aria-hidden="true"><use href="#i-check"></use></svg> Gửi câu trả lời</button></div>
+      </section>
+    </div>
+
+    <!-- Approval modal -->
+    <div class="modal-backdrop" id="approval-modal" hidden>
+      <section class="modal small-modal approval-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-description">
+        <div class="small-modal-icon approval-icon"><svg aria-hidden="true"><use href="#i-shield"></use></svg></div>
+        <button class="modal-close" id="approval-close" type="button" aria-label="Đóng"><svg aria-hidden="true"><use href="#i-x"></use></svg></button>
+        <p class="eyebrow">PHÊ DUYỆT HÀNH ĐỘNG</p>
+        <h2 id="approval-title">Cho phép công cụ này?</h2>
+        <p class="modal-lead" id="approval-description">Tác nhân muốn thực hiện một thao tác trong workspace.</p>
+        <div class="approval-tool"><div class="approval-tool-heading"><span class="tool-icon"><svg aria-hidden="true"><use href="#i-terminal"></use></svg></span><div><span class="field-label">CÔNG CỤ</span><strong id="approval-tool-name">Không xác định</strong></div></div><p class="approval-args" id="approval-tool-args">Không có tham số.</p></div>
+        <div class="approval-warning"><svg aria-hidden="true"><use href="#i-alert"></use></svg><span>Chỉ phê duyệt khi bạn hiểu tác động của thao tác này.</span></div>
+        <p class="modal-error" id="approval-error" role="alert" hidden></p>
+        <div class="modal-actions"><button class="ghost-button" id="approval-reject" type="button">Từ chối</button><button class="primary-button" id="approval-approve" type="button"><svg aria-hidden="true"><use href="#i-check"></use></svg> Phê duyệt một lần</button></div>
+      </section>
+    </div>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <div class="sr-only" id="live-region" aria-live="assertive" aria-atomic="true"></div>
+    <script src="app.js" defer></script>
+  </body>
+</html>

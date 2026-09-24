@@ -1,0 +1,65 @@
+{
+  "name": "codepilot-local",
+  "version": "0.1.0",
+  "description": "Private local coding agent powered by LM Studio and Qwen",
+  "main": "src/main/main.js",
+  "author": "CodePilot Local",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "node scripts/run-tests.js",
+    "smoke": "node scripts/smoke-electron.js",
+    "check": "node scripts/check-syntax.js",
+    "icon": "python scripts/generate-icon.py",
+    "pack": "npm run check && npm test && electron-builder --dir",
+    "dist": "npm run check && npm test && electron-builder"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1"
+  },
+  "devDependencies": {
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "local.codepilot.desktop",
+    "productName": "CodePilot Local",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "CodePilot-Local-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "CodePilot Local"
+    }
+  },
+  "allowScripts": {
+    "electron@44.4.5": true,
+    "electron-winstaller@5.4.0": true
+  }
+}
