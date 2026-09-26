@@ -36,6 +36,10 @@ Model cũ `qwen2.5-coder-14b-instruct` vẫn dùng được nhưng không phù h
 
 Đây là model community distillation, không phải bản phát hành chính thức của Qwen.
 
+### Preset Qwen3 4B Thinking 2507
+
+Đã có preset **Qwen3 4B Thinking 2507 — reasoning** cho model chính thức `Qwen/Qwen3-4B-Thinking-2507`. Preset dùng context `2048`, max output `2048`, Flash Attention bật, tối đa `6` bước và tắt subagent để phù hợp GTX 1050 Ti 4 GB. Model luôn bật thinking, nên nên bắt đầu ở chế độ **Chat**; khi cần dùng Agent, hãy tăng giới hạn bước/subagent sau khi kiểm tra tốc độ thực tế.
+
 ## Chạy lần đầu
 
 Cách nhanh nhất cho người mới: double-click **`START-HERE.cmd`**.

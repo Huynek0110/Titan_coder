@@ -38,6 +38,7 @@ test('defaults and settings sanitization are stable', () => {
   assert.equal(DEFAULT_SETTINGS.flashAttention, true);
   assert.ok(DEFAULT_SETTINGS.modelPreset);
   assert.ok(MODEL_PRESETS.includes('qwen38-4b-distilled-ma7ee7'));
+  assert.ok(MODEL_PRESETS.includes('qwen3-4b-thinking-2507'));
 
   const clean = sanitizeSettings({
     temperature: 99,

@@ -44,6 +44,20 @@
       maxSubagentSteps: 6,
       flashAttention: true
     },
+    'qwen3-4b-thinking-2507': {
+      label: 'Qwen3 4B Thinking 2507 — reasoning',
+      model: 'qwen3-4b-thinking-2507',
+      contextLength: 2048,
+      maxTokens: 2048,
+      contextChars: 8000,
+      maxSteps: 6,
+      maxSubagents: 0,
+      concurrentSubagents: 1,
+      maxSubagentSteps: 4,
+      flashAttention: true,
+      temperature: 0.6,
+      note: 'Model bật thinking; nên thử Chat trước, Agent có thể chậm hơn.'
+    },
     'qwen25-coder-3b': {
       label: 'Qwen2.5 Coder 3B — nhẹ, ổn định',
       model: 'qwen2.5-coder-3b-instruct',
@@ -1981,7 +1995,9 @@
     var models = state.lmStatus && Array.isArray(state.lmStatus.models) ? state.lmStatus.models : [];
     var terms = presetId === 'qwen3-4b-1050ti'
       ? ['qwen3', '4b']
-      : presetId === 'qwen25-coder-3b'
+      : presetId === 'qwen3-4b-thinking-2507'
+        ? ['qwen3', 'thinking', '4b']
+        : presetId === 'qwen25-coder-3b'
         ? ['qwen2.5-coder', '3b']
         : presetId === 'qwen38-4b-distilled-ma7ee7'
           ? ['qwen3.8', '4b']
