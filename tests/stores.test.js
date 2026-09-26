@@ -10,6 +10,7 @@ const {
   APP_NAME,
   APP_VERSION,
   DEFAULT_SETTINGS,
+  MODEL_PRESETS,
   sanitizeSettings,
   updateSettings,
 } = require('../src/main/core/defaults');
@@ -35,6 +36,8 @@ test('defaults and settings sanitization are stable', () => {
   assert.equal(DEFAULT_SETTINGS.maxTokens, 2048);
   assert.equal(DEFAULT_SETTINGS.maxSubagents, 1);
   assert.equal(DEFAULT_SETTINGS.flashAttention, true);
+  assert.ok(DEFAULT_SETTINGS.modelPreset);
+  assert.ok(MODEL_PRESETS.includes('qwen38-4b-distilled-ma7ee7'));
 
   const clean = sanitizeSettings({
     temperature: 99,

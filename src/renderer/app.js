@@ -68,6 +68,20 @@
       maxSubagentSteps: 4,
       flashAttention: true
     },
+    'qwen38-4b-distilled-ma7ee7': {
+      label: 'Qwen3.8 4B Distilled (Ma7ee7) — thinking, thử nghiệm',
+      model: 'Qwen3.8_4B_Distilled_GGUF:Q4_K_M',
+      contextLength: 2048,
+      maxTokens: 2048,
+      contextChars: 8000,
+      maxSteps: 6,
+      maxSubagents: 0,
+      concurrentSubagents: 1,
+      maxSubagentSteps: 4,
+      flashAttention: true,
+      temperature: 0.6,
+      note: 'Model bật thinking; nên thử Chat trước, Agent có thể chậm hơn.'
+    },
     custom: { label: 'Tùy chỉnh', model: '', contextLength: 2048, maxTokens: 2048, contextChars: 8000, maxSteps: 8, maxSubagents: 1, concurrentSubagents: 1, maxSubagentSteps: 6, flashAttention: true }
   };
 
@@ -1969,7 +1983,9 @@
       ? ['qwen3', '4b']
       : presetId === 'qwen25-coder-3b'
         ? ['qwen2.5-coder', '3b']
-        : ['qwen2.5-coder', '14b'];
+        : presetId === 'qwen38-4b-distilled-ma7ee7'
+          ? ['qwen3.8', '4b']
+          : ['qwen2.5-coder', '14b'];
     var match = models.find(function (item) {
       var value = (String(item.id || '') + ' ' + String(item.name || '') + ' ' + String(item.displayName || '')).toLowerCase();
       return terms.every(function (term) { return value.includes(term); });
@@ -1984,13 +2000,14 @@
     if (dom['settings-model-preset-hint']) {
       dom['settings-model-preset-hint'].textContent = presetId === 'custom'
         ? 'Đang dùng cấu hình tùy chỉnh; app không tự tải model.'
-        : 'Preset chỉ điền cấu hình; app không tự tải model.';
+        : (preset.note ? preset.note + ' App không tự tải model.' : 'Preset chỉ điền cấu hình; app không tự tải model.');
     }
     if (presetId === 'custom') return;
     if (dom['settings-model']) dom['settings-model'].value = modelForPreset(presetId);
     if (dom['settings-max-tokens']) dom['settings-max-tokens'].value = preset.maxTokens;
     if (dom['settings-context-length']) dom['settings-context-length'].value = preset.contextLength;
     if (dom['settings-context-chars']) dom['settings-context-chars'].value = preset.contextChars;
+    if (dom['settings-temperature'] && preset.temperature !== undefined) dom['settings-temperature'].value = preset.temperature;
     if (dom['settings-max-steps']) dom['settings-max-steps'].value = preset.maxSteps;
     if (dom['settings-max-subagents']) dom['settings-max-subagents'].value = preset.maxSubagents;
     if (dom['settings-concurrent-subagents']) dom['settings-concurrent-subagents'].value = preset.concurrentSubagents;

@@ -32,4 +32,6 @@ test('onboarding and settings expose the expected local controls', () => {
     assert.match(html, new RegExp(`id=["']${id}["']`));
     assert.match(app, new RegExp(`['"]${id}['"]`));
   }
+  assert.match(html, /qwen38-4b-distilled-ma7ee7/);
+  assert.match(app, /Qwen3\.8_4B_Distilled_GGUF/);
 });

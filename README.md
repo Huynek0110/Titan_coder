@@ -30,6 +30,12 @@ Preset này điền cấu hình an toàn: context LM Studio `2048`, max output `
 
 Model cũ `qwen2.5-coder-14b-instruct` vẫn dùng được nhưng không phù hợp để chạy toàn bộ trên VRAM 4 GB; phần lớn model sẽ bị offload sang RAM/CPU.
 
+### Preset thử nghiệm Qwen3.8 4B
+
+Đã có preset **Qwen3.8 4B Distilled (Ma7ee7) — thinking, thử nghiệm** cho các bản GGUF `Q4_K_M` của repo `Ma7ee7/Qwen3.8_4B_Distilled_GGUF`. Preset dùng kiến trúc Qwen3, context `2048`, max output `2048`, Flash Attention bật, tối đa `6` bước và tắt subagent để giảm áp lực lên GTX 1050 Ti. Model bật thinking nên nên thử **Chat** trước; nếu muốn dùng Agent, hãy tăng subagent sau khi đã load ổn định.
+
+Đây là model community distillation, không phải bản phát hành chính thức của Qwen.
+
 ## Chạy lần đầu
 
 Cách nhanh nhất cho người mới: double-click **`START-HERE.cmd`**.

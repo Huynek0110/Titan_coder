@@ -93,7 +93,7 @@ Object.freeze(DEFAULT_SETTINGS);
 const DEFAULT_CONFIG = Object.freeze({ app: APP_INFO, settings: DEFAULT_SETTINGS });
 
 const APPROVAL_MODES = new Set(['automatic', 'manual', 'ask', 'always', 'never']);
-const MODEL_PRESETS = new Set(['qwen3-4b-1050ti', 'qwen25-coder-3b', 'qwen25-coder-14b', 'custom']);
+const MODEL_PRESETS = new Set(['qwen3-4b-1050ti', 'qwen25-coder-3b', 'qwen25-coder-14b', 'qwen38-4b-distilled-ma7ee7', 'custom']);
 const WEB_PROVIDERS = new Set(['duckduckgo', 'brave']);
 const KNOWN_KEYS = new Set([
   'lmBaseUrl',
