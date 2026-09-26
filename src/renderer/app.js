@@ -14,10 +14,10 @@
     model: '',
     modelPreset: 'qwen3-4b-1050ti',
     temperature: 0.2,
-    maxTokens: 2048,
-    contextLength: 2048,
+    maxTokens: 1024,
+    contextLength: 4096,
     maxSteps: 8,
-    contextChars: 8000,
+    contextChars: 4500,
     maxSubagents: 1,
     concurrentSubagents: 1,
     maxSubagentSteps: 6,
@@ -35,9 +35,9 @@
     'qwen3-4b-1050ti': {
       label: 'Qwen3 4B — GTX 1050 Ti 4GB',
       model: 'qwen3-4b-instruct-2507',
-      contextLength: 2048,
-      maxTokens: 2048,
-      contextChars: 8000,
+      contextLength: 4096,
+      maxTokens: 1024,
+      contextChars: 4500,
       maxSteps: 8,
       maxSubagents: 1,
       concurrentSubagents: 1,
@@ -47,9 +47,9 @@
     'qwen3-4b-thinking-2507': {
       label: 'Qwen3 4B Thinking 2507 — reasoning',
       model: 'qwen3-4b-thinking-2507',
-      contextLength: 2048,
-      maxTokens: 2048,
-      contextChars: 8000,
+      contextLength: 4096,
+      maxTokens: 1024,
+      contextChars: 4500,
       maxSteps: 6,
       maxSubagents: 0,
       concurrentSubagents: 1,
@@ -62,8 +62,8 @@
       label: 'Qwen2.5 Coder 3B — nhẹ, ổn định',
       model: 'qwen2.5-coder-3b-instruct',
       contextLength: 4096,
-      maxTokens: 2048,
-      contextChars: 10000,
+      maxTokens: 1024,
+      contextChars: 4500,
       maxSteps: 8,
       maxSubagents: 1,
       concurrentSubagents: 1,
@@ -74,8 +74,8 @@
       label: 'Qwen2.5 Coder 14B — chất lượng, chậm hơn',
       model: 'qwen2.5-coder-14b-instruct',
       contextLength: 4096,
-      maxTokens: 2048,
-      contextChars: 10000,
+      maxTokens: 1024,
+      contextChars: 4500,
       maxSteps: 6,
       maxSubagents: 0,
       concurrentSubagents: 1,
@@ -85,9 +85,9 @@
     'qwen38-4b-distilled-ma7ee7': {
       label: 'Qwen3.8 4B Distilled (Ma7ee7) — thinking, thử nghiệm',
       model: 'Qwen3.8_4B_Distilled_GGUF:Q4_K_M',
-      contextLength: 2048,
-      maxTokens: 2048,
-      contextChars: 8000,
+      contextLength: 4096,
+      maxTokens: 1024,
+      contextChars: 4500,
       maxSteps: 6,
       maxSubagents: 0,
       concurrentSubagents: 1,
@@ -96,7 +96,7 @@
       temperature: 0.6,
       note: 'Model bật thinking; nên thử Chat trước, Agent có thể chậm hơn.'
     },
-    custom: { label: 'Tùy chỉnh', model: '', contextLength: 2048, maxTokens: 2048, contextChars: 8000, maxSteps: 8, maxSubagents: 1, concurrentSubagents: 1, maxSubagentSteps: 6, flashAttention: true }
+    custom: { label: 'Tùy chỉnh', model: '', contextLength: 4096, maxTokens: 1024, contextChars: 4500, maxSteps: 8, maxSubagents: 1, concurrentSubagents: 1, maxSubagentSteps: 6, flashAttention: true }
   };
 
   var MODES = {
@@ -1545,8 +1545,9 @@
         if (stream) { stream.streaming = false; stream.error = safeError(error, 'Không thể gửi tin nhắn.'); }
       }
       setRunning(false);
-      addActivity('error', { title: 'Không thể gửi tin nhắn', detail: 'Hãy kiểm tra kết nối LM Studio.', status: 'error' });
-      showToast('Gửi tin nhắn thất bại', safeError(error, 'Tác nhân chưa thể bắt đầu.'), 'error');
+      var sendError = safeError(error, 'Tác nhân chưa thể bắt đầu.');
+      addActivity('error', { title: 'Không thể gửi tin nhắn', detail: lmStudioHint(sendError) || 'Hãy kiểm tra kết nối LM Studio.', status: 'error' });
+      showToast('Gửi tin nhắn thất bại', sendError, 'error');
       renderMessages();
     }
   }
@@ -1587,6 +1588,24 @@
     updateContextIndicator();
   }
 
+  function lmStudioHint(errorText) {
+    var text = String(errorText || '').toLowerCase();
+    if (!text) return '';
+    if (text.indexOf('no models loaded') !== -1) {
+      return 'Chưa có model nào được nạp trong LM Studio. Mở LM Studio → Developer → Load model, hoặc bấm "Lưu cấu hình & Load model" ngay dưới ô Mô hình.';
+    }
+    if (text.indexOf('context length') !== -1 && (text.indexOf('too small') !== -1 || text.indexOf('too short') !== -1)) {
+      return 'Context của model nhỏ hơn yêu cầu. Mở LM Studio → My Models → Model Default Configuration → bấm Reload, hoặc nạp lại model với context 4096 rồi bấm "Lưu cấu hình & Load model".';
+    }
+    if (text.indexOf('model_not_found') !== -1 || text.indexOf('model not found') !== -1) {
+      return 'Model ID không tồn tại trong LM Studio. Bấm "Quét" để lấy đúng ID rồi lưu lại cấu hình.';
+    }
+    if (text.indexOf('econnrefused') !== -1 || text.indexOf('fetch failed') !== -1 || text.indexOf('unable to connect') !== -1) {
+      return 'Không kết nối được LM Studio. Kiểm tra LM Studio đang chạy và Local Server đã bật trên cổng 1234.';
+    }
+    return '';
+  }
+
   function failRun(event) {
     var payload = event || {};
     clearInteractionUi();
@@ -1599,7 +1618,7 @@
     state.activityError = true;
     setRunning(false);
     state.runId = null;
-    addActivity('error', { title: 'Lượt chạy kết thúc lỗi', detail: 'Không có thay đổi nào được ghi đè.', status: 'error' });
+    addActivity('error', { title: 'Lượt chạy kết thúc lỗi', detail: lmStudioHint(errorText) || 'Không có thay đổi nào được ghi đè.', status: 'error' });
     renderMessages();
     showToast('Tác nhân gặp lỗi', errorText, 'error');
   }

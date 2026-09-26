@@ -10,6 +10,16 @@ const app = fs.readFileSync(path.join(root, 'src', 'renderer', 'app.js'), 'utf8'
 const html = fs.readFileSync(path.join(root, 'src', 'renderer', 'index.html'), 'utf8');
 const preload = fs.readFileSync(path.join(root, 'src', 'main', 'preload.js'), 'utf8');
 
+test('renderer turns LM Studio failures into actionable Vietnamese hints', () => {
+  assert.match(app, /function lmStudioHint\(/);
+  assert.match(app, /no models loaded/);
+  assert.match(app, /context length/);
+  assert.match(app, /Model Default Configuration/);
+  assert.match(app, /model_not_found/);
+  assert.match(app, /lmStudioHint\(errorText\) \|\|/);
+  assert.match(app, /lmStudioHint\(sendError\) \|\|/);
+});
+
 test('renderer uses the interaction IPC contract instead of starting a second run', () => {
   assert.match(app, /respondInteraction/);
   assert.match(app, /type:\s*'ask-user'/);

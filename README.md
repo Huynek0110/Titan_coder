@@ -26,7 +26,9 @@
 
 Preset được khuyến nghị cho **GTX 1050 Ti 4 GB** là **Qwen3 4B — GTX 1050 Ti 4GB**. App không tự tải model; người dùng tải GGUF `Q4_K_M` trong LM Studio rồi chọn preset trong **Settings → Mô hình**.
 
-Preset này điền cấu hình an toàn: context LM Studio `2048`, max output `2048`, ngân sách ngữ cảnh `8000` chars, Flash Attention bật, tối đa `1` subagent và không chạy song song. Có thể đổi sang preset Qwen2.5 Coder 3B nếu Qwen3 bị OOM.
+Preset này điền cấu hình an toàn: context LM Studio `4096`, max output `1024`, ngân sách ngữ cảnh `4500` chars, Flash Attention bật, tối đa `1` subagent và không chạy song song. Có thể đổi sang preset Qwen2.5 Coder 3B nếu Qwen3 bị OOM.
+
+> **Vì sao context là `4096`?** LM Studio từ chối request khi `prompt tokens + max_tokens` vượt quá context lúc nạp model, với lỗi *"The selected model was loaded with a context length that is too small for this request"*. Prompt của CodePilot (system prompt + toàn bộ schema của 35 tool) đã khoảng `1600` token, nên context `2048` gần như không còn chỗ cho câu trả lời. Bộ preset dùng `4096` + `1024` output và ngân sách lịch sử `4500` chars, đo thực tế trên LM Studio với Qwen3 4B `Q4_K_M`.
 
 Model cũ `qwen2.5-coder-14b-instruct` vẫn dùng được nhưng không phù hợp để chạy toàn bộ trên VRAM 4 GB; phần lớn model sẽ bị offload sang RAM/CPU.
 

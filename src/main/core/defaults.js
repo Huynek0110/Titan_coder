@@ -54,9 +54,15 @@ const DEFAULT_SETTINGS = {
   modelPreset: 'qwen3-4b-1050ti',
   temperature: 0.2,
   topP: 0.9,
-  maxTokens: 2048,
-  contextLength: 2048,
-  contextChars: 8000,
+  // LM Studio rejects a request when prompt tokens + max_tokens exceed the
+  // context the model was loaded with.  The agent prompt alone (system prompt
+  // plus every tool schema) is roughly 1600 tokens, so a 2048 context leaves
+  // no room at all.  4096 context with 1024 output tokens fits a full turn on
+  // a 4 GB card, and the history budget stays small enough to leave headroom
+  // for tool results.
+  maxTokens: 1024,
+  contextLength: 4096,
+  contextChars: 4500,
   maxSteps: 8,
   maxSubagents: 1,
   maxConcurrentSubagents: 1,

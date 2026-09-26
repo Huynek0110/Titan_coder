@@ -32,8 +32,8 @@ test('defaults and settings sanitization are stable', () => {
   assert.equal(DEFAULT_SETTINGS.webProvider, 'duckduckgo');
   assert.equal(DEFAULT_SETTINGS.searchProvider, 'duckduckgo');
   assert.equal(DEFAULT_SETTINGS.modelPreset, 'qwen3-4b-1050ti');
-  assert.equal(DEFAULT_SETTINGS.contextLength, 2048);
-  assert.equal(DEFAULT_SETTINGS.maxTokens, 2048);
+  assert.equal(DEFAULT_SETTINGS.contextLength, 4096);
+  assert.equal(DEFAULT_SETTINGS.maxTokens, 1024);
   assert.equal(DEFAULT_SETTINGS.maxSubagents, 1);
   assert.equal(DEFAULT_SETTINGS.flashAttention, true);
   assert.ok(DEFAULT_SETTINGS.modelPreset);
@@ -198,8 +198,46 @@ test('session store caps sessions, trims messages, and serializes concurrent app
   assert.equal(summaries.some((item) => item.id === first.id), false);
 });
 
-test('session runs and tool data are bounded and corrupt files recover', async (t) => {
-  const dir = tempDir(t);
+test('default token budget leaves room for the agent prompt and tool schemas', () => {
+  const WorkspaceTools = require('../src/main/tools/workspace-tools').WorkspaceTools;
+  const SystemTools = require('../src/main/tools/system-tools').SystemTools;
+  const WebTools = require('../src/main/tools/web-tools').WebTools;
+  const { systemPrompt } = require('../src/main/core/agent-runner');
+
+  const root = process.cwd();
+  const sources = [
+    new WorkspaceTools({ root }),
+    new SystemTools({ root, logDir: root }),
+    new WebTools({ searchProvider: 'duckduckgo' }),
+  ];
+  const tools = sources.flatMap((source) => source.definitions('agent')).map((definition) => ({
+    type: 'function',
+    function: {
+      name: definition.name,
+      description: definition.description || '',
+      parameters: definition.parameters || definition.schema || {},
+    },
+  }));
+  const promptChars = systemPrompt({
+    mode: 'agent',
+    workspace: root,
+    settings: DEFAULT_SETTINGS,
+    hasWorkspace: true,
+  }).length + JSON.stringify(tools).length;
+
+  // Measured against LM Studio: the real agent turn is about 3.2 characters
+  // per token, so three is a safe over-estimate.  Anything larger than a
+  // 2048 context makes LM Studio reject every request before it starts.
+  const promptTokens = Math.ceil(promptChars / 3);
+  const room = DEFAULT_SETTINGS.contextLength - DEFAULT_SETTINGS.maxTokens;
+  assert.ok(tools.length >= 20, 'expected the agent tool surface to stay complete');
+  assert.ok(
+    room - promptTokens > 1000,
+    `context budget too small: ${room} tokens available, prompt uses ~${promptTokens}`
+  );
+});
+
+test('session runs and tool data are bounded and corrupt files recover', async (t) => {  const dir = tempDir(t);
   const store = new SessionStore({ dir });
   await store.init();
   const session = await store.createSession({ workspace: '', mode: 'agent', title: 'runs' });
